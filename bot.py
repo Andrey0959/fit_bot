@@ -76,6 +76,10 @@ HELP_TEXT = (
     "<b>5) КБЖУ</b> — норма калорий и БЖУ (Миффлин-Сан Жеор)\n"
     "<code>/kbju м 30 180 85 3 сушка</code>\n"
     "(пол, возраст, рост см, вес кг, активность 1-5, цель: сушка/поддержание/масса)\n\n"
+    "<b>6) RPE</b> — оценка 1ПМ по субъективной тяжести подхода\n"
+    "<code>/rpe 140 3 8</code>  (вес, повторы, RPE от 6 до 10)\n\n"
+    "<b>7) Разминка</b> — лестница подходов от грифа до рабочего веса\n"
+    "<code>/warmup 140</code>  (рабочий вес; свой гриф — вторым числом)\n\n"
     "Дробные — через точку или запятую: <code>82.5</code> или <code>82,5</code>."
 )
 
@@ -318,6 +322,70 @@ async def cmd_kbju(message: Message):
 
 
 # ---------------------------------------------------------------------------
+# RPE
+# ---------------------------------------------------------------------------
+
+@dp.message(Command("rpe"))
+async def cmd_rpe(message: Message):
+    args = _args(message)
+    if len(args) != 3:
+        await message.answer(
+            "Формат: <code>/rpe 140 3 8</code> (вес, повторы, RPE от 6 до 10)"
+        )
+        return
+    try:
+        weight = calc.parse_number(args[0])
+        reps = calc.parse_number(args[1])
+        rpe = calc.parse_number(args[2])
+        r = calc.calc_rpe(weight, reps, rpe)
+    except ValueError as e:
+        await message.answer(f"⚠️ {e}")
+        return
+
+    lines = [f"<b>{r.weight:g} кг × {r.reps} на RPE {r.rpe_used:g}</b>"]
+    if r.rpe_used != r.rpe:
+        lines.append(f"(округлил RPE {r.rpe:g} → {r.rpe_used:g}, шаг таблицы — 0.5)")
+    lines.append(f"<b>Оценка 1ПМ: {r.estimated_1rm:.1f} кг</b>")
+    lines.append("")
+    lines.append(f"Тот же вес {r.reps} повторов на другой RPE:")
+    for rpe_val, w in r.projection:
+        lines.append(f"RPE {rpe_val:g} — {w:g} кг")
+
+    await message.answer("\n".join(lines))
+
+
+# ---------------------------------------------------------------------------
+# Разминка
+# ---------------------------------------------------------------------------
+
+@dp.message(Command("warmup"))
+async def cmd_warmup(message: Message):
+    args = _args(message)
+    if len(args) not in (1, 2):
+        await message.answer(
+            "Формат: <code>/warmup 140</code> (рабочий вес)\n"
+            "Можно указать свой гриф: <code>/warmup 140 15</code>"
+        )
+        return
+    try:
+        work_weight = calc.parse_number(args[0])
+        bar_weight = calc.parse_number(args[1]) if len(args) == 2 else 20.0
+        steps = calc.generate_warmup(work_weight, bar_weight)
+    except ValueError as e:
+        await message.answer(f"⚠️ {e}")
+        return
+
+    lines = [f"<b>Разминка до {work_weight:g} кг</b>"]
+    for step in steps:
+        if step.reps:
+            lines.append(f"{step.label}: {step.weight:g} кг × {step.reps}")
+        else:
+            lines.append(f"<b>{step.label}: {step.weight:g} кг</b>")
+
+    await message.answer("\n".join(lines))
+
+
+# ---------------------------------------------------------------------------
 # Генерация карточки по кнопке
 # ---------------------------------------------------------------------------
 
@@ -371,6 +439,8 @@ BOT_COMMANDS = [
     BotCommand(command="wilks", description="Wilks: пол, вес атлета, сумма"),
     BotCommand(command="ffmi", description="FFMI: рост, вес, % жира"),
     BotCommand(command="kbju", description="КБЖУ: пол, возраст, рост, вес, активность, цель"),
+    BotCommand(command="rpe", description="Оценка 1ПМ по RPE: вес, повторы, RPE"),
+    BotCommand(command="warmup", description="Разминка до рабочего веса"),
     BotCommand(command="help", description="Как пользоваться ботом"),
 ]
 

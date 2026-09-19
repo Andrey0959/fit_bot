@@ -187,3 +187,104 @@ def calc_kbju(sex: str, age: int, height_cm: float, weight_kg: float,
     carbs_g = max((target - kcal_from_pf) / 4, 0)
 
     return KbjuResult(bmr, tdee, target, protein_g, fat_g, carbs_g, activity_label, goal_label)
+
+
+# ---------------------------------------------------------------------------
+# RPE (Rate of Perceived Exertion) — таблица % от 1ПМ по повторам и RPE.
+# Источник: общепринятая RPE-таблица (Tuchscherer / RTS), используется как
+# стандарт в пауэрлифтинге для автоматической регулировки нагрузки.
+# ---------------------------------------------------------------------------
+
+# ключ — RPE (6.0 .. 10.0 с шагом 0.5), значение — список % от 1ПМ для 1..10 повторов
+_RPE_TABLE = {
+    10.0: [1.000, 0.955, 0.922, 0.892, 0.863, 0.837, 0.811, 0.786, 0.762, 0.739],
+    9.5:  [0.978, 0.939, 0.907, 0.878, 0.850, 0.825, 0.800, 0.776, 0.752, 0.730],
+    9.0:  [0.955, 0.922, 0.892, 0.863, 0.837, 0.811, 0.786, 0.762, 0.739, 0.717],
+    8.5:  [0.939, 0.907, 0.878, 0.850, 0.825, 0.800, 0.776, 0.752, 0.730, 0.707],
+    8.0:  [0.922, 0.892, 0.863, 0.837, 0.811, 0.786, 0.762, 0.739, 0.717, 0.694],
+    7.5:  [0.907, 0.878, 0.850, 0.825, 0.800, 0.776, 0.752, 0.730, 0.707, 0.685],
+    7.0:  [0.892, 0.863, 0.837, 0.811, 0.786, 0.762, 0.739, 0.717, 0.694, 0.672],
+    6.5:  [0.878, 0.850, 0.825, 0.800, 0.776, 0.752, 0.730, 0.707, 0.685, 0.664],
+    6.0:  [0.863, 0.837, 0.811, 0.786, 0.762, 0.739, 0.717, 0.694, 0.672, 0.650],
+}
+
+_RPE_MIN, _RPE_MAX = 6.0, 10.0
+_RPE_REPS_MAX = 10
+
+
+def _snap_rpe(rpe: float) -> float:
+    """Округление RPE до ближайшего шага 0.5, с зажимом в границы таблицы."""
+    snapped = round(rpe * 2) / 2
+    return min(max(snapped, _RPE_MIN), _RPE_MAX)
+
+
+def _rpe_percent(reps: int, rpe: float) -> float:
+    if not (1 <= reps <= _RPE_REPS_MAX):
+        raise ValueError(f"RPE-таблица покрывает 1-{_RPE_REPS_MAX} повторов")
+    rpe = _snap_rpe(rpe)
+    return _RPE_TABLE[rpe][reps - 1]
+
+
+@dataclass
+class RpeResult:
+    weight: float
+    reps: int
+    rpe: float
+    rpe_used: float  # после округления до шага 0.5
+    estimated_1rm: float
+    projection: List[tuple]  # (rpe, вес) для тех же повторов на другие RPE
+
+
+def calc_rpe(weight: float, reps: int, rpe: float) -> RpeResult:
+    if weight <= 0:
+        raise ValueError("Вес должен быть больше нуля")
+    reps = int(round(reps))
+    rpe_used = _snap_rpe(rpe)
+    pct = _rpe_percent(reps, rpe_used)
+    est_1rm = weight / pct
+
+    projection = []
+    for target_rpe in (10.0, 9.0, 8.0, 7.0):
+        w = round_plate(est_1rm * _rpe_percent(reps, target_rpe))
+        projection.append((target_rpe, w))
+
+    return RpeResult(weight, reps, rpe, rpe_used, est_1rm, projection)
+
+
+# ---------------------------------------------------------------------------
+# Разминка — стандартная лестница от пустого грифа до рабочего веса
+# ---------------------------------------------------------------------------
+
+@dataclass
+class WarmupStep:
+    label: str
+    weight: float
+    reps: int
+
+
+def generate_warmup(work_weight: float, bar_weight: float = 20.0) -> List[WarmupStep]:
+    if work_weight <= 0:
+        raise ValueError("Рабочий вес должен быть больше нуля")
+    if bar_weight <= 0:
+        raise ValueError("Вес грифа должен быть больше нуля")
+
+    steps: List[WarmupStep] = []
+
+    if work_weight <= bar_weight:
+        # рабочий вес не тяжелее грифа — разминка не нужна, только сам подход
+        steps.append(WarmupStep("Рабочий", work_weight, 0))
+        return steps
+
+    steps.append(WarmupStep("Гриф", bar_weight, 8))
+
+    ladder = [(0.40, 5), (0.60, 3), (0.80, 2), (0.90, 1)]
+    for pct, reps in ladder:
+        w = round_plate(work_weight * pct)
+        # пропускаем ступени легче грифа или почти равные рабочему весу —
+        # они не добавляют пользы и только удлиняют разминку
+        if w <= bar_weight or w >= work_weight:
+            continue
+        steps.append(WarmupStep(f"{int(pct * 100)}%", w, reps))
+
+    steps.append(WarmupStep("Рабочий", work_weight, 0))
+    return steps
