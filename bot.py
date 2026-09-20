@@ -466,7 +466,6 @@ BOT_COMMANDS = [
 async def main():
     if not TOKEN:
         raise SystemExit("Не найден BOT_TOKEN. Положи его в .env (см. README.md)")
-    _init_db()
     bot = Bot(token=TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     await bot.set_my_commands(BOT_COMMANDS)
     await dp.start_polling(bot)
