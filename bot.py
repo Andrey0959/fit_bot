@@ -58,28 +58,42 @@ def _card_button(kind: str) -> InlineKeyboardMarkup:
     )
 
 
+# Ориентировочные шкалы уровня для карточек (DOTS/Wilks и FFMI) — границы
+# приблизительные, для наглядности на картинке, не претендуют на строгую
+# классификацию федераций.
+_STRENGTH_GAUGE = {"min": 100, "max": 600, "labels": ["Новичок", "Любитель", "Продвинутый", "Элита", "Топ"]}
+_FFMI_GAUGE = {"min": 15, "max": 28, "labels": ["Низкий", "Средний", "Хороший", "Предел", "Выше"]}
+
+
 # ---------------------------------------------------------------------------
 # /start, /help
 # ---------------------------------------------------------------------------
 
 HELP_TEXT = (
-    "<b>Карманный математический инженер для зала</b>\n"
-    "Кидаешь цифры между подходами — получаешь готовую математику. Без сайтов, без регистраций.\n\n"
-    "<b>1) Разовый максимум + раскладка по %</b>\n"
-    "Просто напиши: <code>100 8</code>  (вес и повторы)\n\n"
-    "<b>2) DOTS</b> — сила с поправкой на вес тела\n"
-    "<code>/dots м 90 500</code>  (пол, вес атлета, сумма/вес на штанге)\n\n"
-    "<b>3) Wilks</b> — то же самое, старый привычный коэффициент\n"
+    "🏋️ <b>Карманный математический инженер для зала</b>\n"
+    "<i>Кидаешь цифры между подходами — получаешь готовую математику. Без сайтов, без регистраций.</i>\n\n"
+    "━━━━━━━━━━━━━━━\n\n"
+    "💪 <b>Разовый максимум + раскладка по %</b>\n"
+    "Просто напиши: <code>100 8</code>\n"
+    "<i>(вес и повторы — без команды, самый быстрый путь)</i>\n\n"
+    "⚖️ <b>DOTS</b> — сила с поправкой на вес тела\n"
+    "<code>/dots м 90 500</code>\n"
+    "<i>(пол, вес атлета, сумма/вес на штанге)</i>\n\n"
+    "🏆 <b>Wilks</b> — старый привычный коэффициент\n"
     "<code>/wilks ж 62.5 280</code>\n\n"
-    "<b>4) FFMI</b> — индекс сухой массы\n"
-    "<code>/ffmi 180 85 15</code>  (рост см, вес кг, % жира)\n\n"
-    "<b>5) КБЖУ</b> — норма калорий и БЖУ (Миффлин-Сан Жеор)\n"
+    "📏 <b>FFMI</b> — индекс сухой массы\n"
+    "<code>/ffmi 180 85 15</code>\n"
+    "<i>(рост см, вес кг, % жира)</i>\n\n"
+    "🍗 <b>КБЖУ</b> — калории и БЖУ (Миффлин-Сан Жеор)\n"
     "<code>/kbju м 30 180 85 3 сушка</code>\n"
-    "(пол, возраст, рост см, вес кг, активность 1-5, цель: сушка/поддержание/масса)\n\n"
-    "<b>6) RPE</b> — оценка 1ПМ по субъективной тяжести подхода\n"
-    "<code>/rpe 140 3 8</code>  (вес, повторы, RPE от 6 до 10)\n\n"
-    "<b>7) Разминка</b> — лестница подходов от грифа до рабочего веса\n"
-    "<code>/warmup 140</code>  (рабочий вес; свой гриф — вторым числом)\n\n"
+    "<i>(пол, возраст, рост см, вес кг, активность 1-5, цель)</i>\n\n"
+    "🔥 <b>RPE</b> — оценка 1ПМ по тяжести подхода\n"
+    "<code>/rpe 140 3 8</code>\n"
+    "<i>(вес, повторы, RPE от 6 до 10)</i>\n\n"
+    "🔧 <b>Разминка</b> — лестница до рабочего веса\n"
+    "<code>/warmup 140</code>\n"
+    "<i>(рабочий вес; свой гриф — вторым числом)</i>\n\n"
+    "━━━━━━━━━━━━━━━\n"
     "Дробные — через точку или запятую: <code>82.5</code> или <code>82,5</code>."
 )
 
@@ -226,6 +240,7 @@ async def _strength_score(message: Message, kind: str):
         "label": label,
         "sub_label": "Атлет",
         "sub_value": f"{bw:g} кг · сумма {total:g} кг",
+        "gauge": _STRENGTH_GAUGE,
     }
     await message.answer(text, reply_markup=_card_button(kind))
 
@@ -271,6 +286,7 @@ async def cmd_ffmi(message: Message):
         "label": "FFMI (норм.)",
         "sub_label": "Вывод",
         "sub_value": r.verdict,
+        "gauge": _FFMI_GAUGE,
     }
     await message.answer(text, reply_markup=_card_button("ffmi"))
 
@@ -400,9 +416,11 @@ async def make_card(callback: CallbackQuery):
     if kind == "1rm":
         png = cards.card_1rm(data["weight"], data["reps"], data["average"], data["table"], brand=BRAND)
     elif kind in ("dots", "wilks"):
-        png = cards.card_score(data["label"], data["score"], data["sub_label"], data["sub_value"], brand=BRAND)
+        png = cards.card_score(data["label"], data["score"], data["sub_label"], data["sub_value"],
+                                brand=BRAND, gauge=data.get("gauge"))
     elif kind == "ffmi":
-        png = cards.card_score(data["label"], data["score"], data["sub_label"], data["sub_value"], brand=BRAND)
+        png = cards.card_score(data["label"], data["score"], data["sub_label"], data["sub_value"],
+                                brand=BRAND, gauge=data.get("gauge"))
     elif kind == "kbju":
         png = cards.card_kbju(data["target"], data["protein"], data["fat"], data["carbs"], data["goal_label"], brand=BRAND)
     else:
@@ -434,20 +452,21 @@ async def on_error(event):
 # ---------------------------------------------------------------------------
 
 BOT_COMMANDS = [
-    BotCommand(command="rm", description="1RM + раскладка по % (вес, повторы)"),
-    BotCommand(command="dots", description="DOTS: пол, вес атлета, сумма"),
-    BotCommand(command="wilks", description="Wilks: пол, вес атлета, сумма"),
-    BotCommand(command="ffmi", description="FFMI: рост, вес, % жира"),
-    BotCommand(command="kbju", description="КБЖУ: пол, возраст, рост, вес, активность, цель"),
-    BotCommand(command="rpe", description="Оценка 1ПМ по RPE: вес, повторы, RPE"),
-    BotCommand(command="warmup", description="Разминка до рабочего веса"),
-    BotCommand(command="help", description="Как пользоваться ботом"),
+    BotCommand(command="rm", description="💪 1RM + раскладка по % (вес, повторы)"),
+    BotCommand(command="dots", description="⚖️ DOTS: пол, вес атлета, сумма"),
+    BotCommand(command="wilks", description="🏆 Wilks: пол, вес атлета, сумма"),
+    BotCommand(command="ffmi", description="📏 FFMI: рост, вес, % жира"),
+    BotCommand(command="kbju", description="🍗 КБЖУ: пол, возраст, рост, вес, активность, цель"),
+    BotCommand(command="rpe", description="🔥 Оценка 1ПМ по RPE: вес, повторы, RPE"),
+    BotCommand(command="warmup", description="🔧 Разминка до рабочего веса"),
+    BotCommand(command="help", description="ℹ️ Как пользоваться ботом"),
 ]
 
 
 async def main():
     if not TOKEN:
         raise SystemExit("Не найден BOT_TOKEN. Положи его в .env (см. README.md)")
+    _init_db()
     bot = Bot(token=TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     await bot.set_my_commands(BOT_COMMANDS)
     await dp.start_polling(bot)

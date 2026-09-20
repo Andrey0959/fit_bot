@@ -11,16 +11,25 @@ from PIL import Image, ImageDraw, ImageFont
 
 W, H = 1080, 1080
 
-BG_TOP = (20, 20, 23)
-BG_BOTTOM = (12, 12, 14)
-ACCENT = (214, 255, 64)      # кислотно-салатовый — читается как "спортивный"
-WHITE = (245, 245, 245)
-GRAY = (150, 150, 155)
-LINE = (48, 48, 52)
+BG_TOP = (18, 19, 21)
+BG_BOTTOM = (12, 13, 14)
+ACCENT = (214, 255, 64)      # единственный яркий цвет на карточке — используется точечно
+WHITE = (240, 240, 240)
+GRAY = (140, 140, 146)
+LINE = (42, 42, 46)
+TRACK = (38, 39, 42)         # фон прогресс-полосы (единый для всех, без разноцветицы)
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _FONT_BOLD_PATH = os.path.join(_HERE, "fonts", "DejaVuSans-Bold.ttf")
 _FONT_REGULAR_PATH = os.path.join(_HERE, "fonts", "DejaVuSans.ttf")
+
+if not (os.path.exists(_FONT_BOLD_PATH) and os.path.exists(_FONT_REGULAR_PATH)):
+    print(
+        "[cards.py] ВНИМАНИЕ: не найдены шрифты по пути "
+        f"{os.path.join(_HERE, 'fonts')} — кириллица на карточках отрисуется квадратами. "
+        "Проверь, что папка 'fonts' с файлами DejaVuSans.ttf и DejaVuSans-Bold.ttf "
+        "лежит рядом с cards.py."
+    )
 
 
 def _font(bold: bool, size: int) -> ImageFont.FreeTypeFont:
@@ -42,6 +51,13 @@ def _base_card():
         g = int(BG_TOP[1] + (BG_BOTTOM[1] - BG_TOP[1]) * t)
         b = int(BG_TOP[2] + (BG_BOTTOM[2] - BG_TOP[2]) * t)
         draw.line([(0, y), (W, y)], fill=(r, g, b))
+
+    # едва заметный силуэт блинов в углу — чисто текстура, не должна спорить
+    # с текстом, поэтому цвет почти сливается с фоном (на 4-6 оттенков светлее)
+    plate_color = (BG_TOP[0] + 5, BG_TOP[1] + 5, BG_TOP[2] + 6)
+    draw.ellipse([W - 320, H - 420, W + 220, H + 80], outline=plate_color, width=26)
+    draw.ellipse([W - 200, H - 300, W + 340, H + 200], outline=plate_color, width=18)
+
     # акцентная полоса сверху
     draw.rectangle([0, 0, W, 16], fill=ACCENT)
     return img, draw
@@ -50,12 +66,40 @@ def _base_card():
 def _footer(draw, brand: str):
     f_small = _font(False, 28)
     draw.text((60, H - 68), brand, font=f_small, fill=GRAY)
-    # маленькая точка-акцент рядом с брендом
-    draw.ellipse([60 - 0, H - 66, 60 - 0, H - 66], fill=ACCENT)
 
 
 def _hline(draw, y):
     draw.line([(60, y), (W - 60, y)], fill=LINE, width=2)
+
+
+def _draw_gauge(draw, x, y, width, value, vmin, vmax, labels, f_tick):
+    """Сегментированная шкала уровня (новичок → топ) с указателем текущего результата.
+    Активный сегмент подсвечивается акцентом, остальные — нейтральный трек."""
+    n = len(labels)
+    gap = 6
+    seg_w = (width - gap * (n - 1)) / n
+    track_h = 22
+
+    t = max(0.0, min(1.0, (value - vmin) / (vmax - vmin)))
+    active_idx = min(n - 1, int(t * n))
+
+    for i in range(n):
+        seg_x0 = x + i * (seg_w + gap)
+        seg_x1 = seg_x0 + seg_w
+        color = ACCENT if i == active_idx else TRACK
+        draw.rounded_rectangle([seg_x0, y, seg_x1, y + track_h], radius=6, fill=color)
+
+    # указатель — маленький треугольник точно над результатом
+    px = x + t * width
+    draw.polygon([(px - 10, y - 16), (px + 10, y - 16), (px, y - 2)], fill=WHITE)
+
+    for i, label in enumerate(labels):
+        seg_x0 = x + i * (seg_w + gap)
+        cx = seg_x0 + seg_w / 2
+        bbox = draw.textbbox((0, 0), label, font=f_tick)
+        tw = bbox[2] - bbox[0]
+        color = WHITE if i == active_idx else GRAY
+        draw.text((cx - tw / 2, y + track_h + 14), label, font=f_tick, fill=color)
 
 
 def card_1rm(weight, reps, average, table, brand="@thirstforfame1") -> bytes:
@@ -76,13 +120,16 @@ def card_1rm(weight, reps, average, table, brand="@thirstforfame1") -> bytes:
     y = 410
     _hline(draw, y)
     y += 44
+    bar_max = 260
     for pct, w in table:
-        # прогресс-полоса под каждый %, чисто декоративно
-        bar_w = int(240 * (pct / 95))
-        draw.rounded_rectangle([60, y + 10, 60 + bar_w, y + 20], radius=5,
-                                fill=ACCENT if pct >= 85 else (90, 95, 40))
-        draw.text((320, y), f"{pct}%", font=f_row, fill=GRAY)
-        draw.text((430, y), f"{w:g} кг", font=f_row_b, fill=WHITE)
+        # единая серая полоса-трек + заливка — без цветового разнобоя,
+        # акцентный цвет только у топовых процентов (85%+, рабочие пики)
+        draw.rounded_rectangle([60, y + 8, 60 + bar_max, y + 22], radius=7, fill=TRACK)
+        bar_w = int(bar_max * (pct / 95))
+        fill_color = ACCENT if pct >= 85 else WHITE
+        draw.rounded_rectangle([60, y + 8, 60 + bar_w, y + 22], radius=7, fill=fill_color)
+        draw.text((350, y), f"{pct}%", font=f_row, fill=GRAY)
+        draw.text((460, y), f"{w:g} кг", font=f_row_b, fill=WHITE)
         y += 66
 
     _footer(draw, brand)
@@ -91,13 +138,16 @@ def card_1rm(weight, reps, average, table, brand="@thirstforfame1") -> bytes:
     return buf.getvalue()
 
 
-def card_score(score_label, score_value, sub_label, sub_value, brand="@thirstforfame1") -> bytes:
-    """Универсальная карточка на одно большое число (DOTS/Wilks/FFMI)."""
+def card_score(score_label, score_value, sub_label, sub_value, brand="@thirstforfame1",
+               gauge=None) -> bytes:
+    """Универсальная карточка на одно большое число (DOTS/Wilks/FFMI).
+    gauge (опционально): dict с ключами min, max, labels — рисует шкалу уровня
+    под текстом с указателем текущего результата."""
     img, draw = _base_card()
     f_label = _font(False, 32)
     f_big = _font(True, 170)
-    f_sub_label = _font(False, 32)
     f_sub = _font(False, 38)
+    f_tick = _font(False, 24)
 
     draw.text((60, 100), score_label.upper(), font=f_label, fill=ACCENT)
     draw.text((58, 150), f"{score_value:.1f}", font=f_big, fill=WHITE)
@@ -118,6 +168,14 @@ def card_score(score_label, score_value, sub_label, sub_value, brand="@thirstfor
             y += 48
         draw.text((60, y), line, font=f_sub, fill=WHITE)
         y += 48
+
+    if gauge:
+        y += 40
+        _draw_gauge(
+            draw, x=60, y=y, width=W - 120,
+            value=score_value, vmin=gauge["min"], vmax=gauge["max"],
+            labels=gauge["labels"], f_tick=f_tick,
+        )
 
     _footer(draw, brand)
     buf = io.BytesIO()
@@ -141,14 +199,15 @@ def card_kbju(target, protein, fat, carbs, goal_label, brand="@thirstforfame1") 
     y = 410
     _hline(draw, y)
     y += 50
-    total = protein * 4 + fat * 9 + carbs * 4
+    # единая палитра: акцент только у белков (главный приоритет для тренирующегося),
+    # остальное — нейтральный белый маркер, без цветового шума
     rows = [
-        ("Белки", protein, "г", (214, 255, 64)),
-        ("Жиры", fat, "г", (255, 170, 90)),
-        ("Углеводы", carbs, "г", (110, 190, 255)),
+        ("Белки", protein, "г", ACCENT),
+        ("Жиры", fat, "г", WHITE),
+        ("Углеводы", carbs, "г", WHITE),
     ]
     for label, val, unit, color in rows:
-        draw.rounded_rectangle([60, y + 8, 84, y + 32], radius=6, fill=color)
+        draw.rounded_rectangle([60, y + 10, 82, y + 32], radius=5, fill=color)
         draw.text((105, y), label, font=f_row, fill=GRAY)
         draw.text((430, y), f"{val:.0f} {unit}", font=f_row_b, fill=WHITE)
         y += 72
