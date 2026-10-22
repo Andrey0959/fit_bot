@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 Карманный математический инженер для зала.
-Стек: aiogram 3.x, python-dotenv, Pillow (карточки).
+Стек: aiogram 3.x, python-dotenv, Pillow (карточки), sqlite3 (аналитика).
 
 Запуск: см. README.md
 """
@@ -11,27 +11,41 @@ import logging
 import os
 import re
 from logging.handlers import RotatingFileHandler
+from typing import Any, Awaitable, Callable
 
-from aiogram import Bot, Dispatcher, F
+from aiogram import BaseMiddleware, Bot, Dispatcher, F
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
-from aiogram.filters import Command, CommandStart
+from aiogram.filters import Command, CommandObject, CommandStart
 from aiogram.types import (
     BotCommand,
     BufferedInputFile,
     CallbackQuery,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
+    InlineQuery,
+    InlineQueryResultArticle,
+    InputTextMessageContent,
     Message,
+    TelegramObject,
+    User,
 )
 from dotenv import load_dotenv
 
 import calculators as calc
 import cards
+import storage
 
 load_dotenv()
 TOKEN = os.getenv("BOT_TOKEN")
-BRAND = os.getenv("BRAND_TAG", "@thirstforfame1")
+CHANNEL = os.getenv("CHANNEL", "thirstforfame1").lstrip("@")
+CHANNEL_URL = f"https://t.me/{CHANNEL}"
+ADMIN_ID = int(os.getenv("ADMIN_ID", "0") or 0)  # свой user_id — для /stats
+DB_PATH = os.getenv("DB_PATH", "bot.db")
+
+# Заполняется при старте из bot.get_me(), чтобы не хардкодить username:
+# сменил бота в BotFather — подпись на карточках поменялась сама.
+BOT_USERNAME = ""
 
 logging.basicConfig(
     level=logging.INFO,
@@ -52,17 +66,73 @@ dp = Dispatcher()
 _LAST_RESULT: dict[int, dict] = {}
 
 
-def _card_button(kind: str) -> InlineKeyboardMarkup:
+def _brand() -> str:
+    """Подпись в подвале карточки: канал + бот, чтобы по пересланной
+    картинке можно было найти и то и другое."""
+    return f"@{CHANNEL} · @{BOT_USERNAME}" if BOT_USERNAME else f"@{CHANNEL}"
+
+
+def _channel_row() -> list[InlineKeyboardButton]:
+    return [InlineKeyboardButton(text="📢 Канал: разборы и программы", url=CHANNEL_URL)]
+
+
+def _result_kb(kind: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
-        inline_keyboard=[[InlineKeyboardButton(text="🖼 Сделать карточку", callback_data=f"card:{kind}")]]
+        inline_keyboard=[
+            [InlineKeyboardButton(text="🖼 Сделать карточку", callback_data=f"card:{kind}")],
+            _channel_row(),
+        ]
     )
 
 
-# Ориентировочные шкалы уровня для карточек (DOTS/Wilks и FFMI) — границы
-# приблизительные, для наглядности на картинке, не претендуют на строгую
-# классификацию федераций.
+def _start_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[_channel_row()])
+
+
+def _share_kb() -> InlineKeyboardMarkup:
+    """Под карточкой: подпись зовёт друга посчитать свой — значит первая
+    кнопка должна вести в бота, а не только в канал."""
+    rows = []
+    if BOT_USERNAME:
+        rows.append([InlineKeyboardButton(
+            text="🧮 Посчитать свой", url=f"https://t.me/{BOT_USERNAME}?start=card"
+        )])
+    rows.append(_channel_row())
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+# Ориентировочные шкалы уровня для карточек (DOTS/Wilks и FFMI) — для
+# наглядности, не строгая классификация федераций.
 _STRENGTH_GAUGE = {"min": 100, "max": 600, "labels": ["Новичок", "Любитель", "Продвинутый", "Элита", "Топ"]}
 _FFMI_GAUGE = {"min": 15, "max": 28, "labels": ["Низкий", "Средний", "Хороший", "Предел", "Выше"]}
+
+
+# ---------------------------------------------------------------------------
+# Аналитика: каждый апдейт обновляет last_seen пользователя.
+# Ошибка БД не должна ронять ответ пользователю — поэтому только логируем.
+# ---------------------------------------------------------------------------
+
+class TrackUsersMiddleware(BaseMiddleware):
+    async def __call__(
+        self,
+        handler: Callable[[TelegramObject, dict[str, Any]], Awaitable[Any]],
+        event: TelegramObject,
+        data: dict[str, Any],
+    ) -> Any:
+        user: User | None = data.get("event_from_user")
+        if user:
+            try:
+                storage.touch_user(user.id)
+            except Exception:
+                logger.exception("Не удалось обновить пользователя в БД")
+        return await handler(event, data)
+
+
+def _log(user_id: int, kind: str) -> None:
+    try:
+        storage.log_event(user_id, kind)
+    except Exception:
+        logger.exception("Не удалось записать событие %s", kind)
 
 
 # ---------------------------------------------------------------------------
@@ -93,19 +163,61 @@ HELP_TEXT = (
     "🔧 <b>Разминка</b> — лестница до рабочего веса\n"
     "<code>/warmup 140</code>\n"
     "<i>(рабочий вес; свой гриф — вторым числом)</i>\n\n"
+    "🏅 <b>Разряд ЕВСК</b> — по сумме троеборья и весу\n"
+    "<code>/rank м 90 500</code>\n"
+    "<i>(пол, вес атлета, сумма троеборья)</i>\n\n"
     "━━━━━━━━━━━━━━━\n"
-    "Дробные — через точку или запятую: <code>82.5</code> или <code>82,5</code>."
+    "Дробные — через точку или запятую: <code>82.5</code> или <code>82,5</code>.\n\n"
+    "💡 Считать можно прямо в любом чате: напиши <code>@{bot} 100 8</code>"
 )
 
 
+def _help_text() -> str:
+    return HELP_TEXT.replace("{bot}", BOT_USERNAME or "бот")
+
+
 @dp.message(CommandStart())
-async def cmd_start(message: Message):
-    await message.answer(HELP_TEXT)
+async def cmd_start(message: Message, command: CommandObject):
+    # t.me/bot?start=vk_clip1 -> source="vk_clip1": так видно, какой ролик/пост привёл людей
+    source = (command.args or "").strip()[:64] or None
+    if source:
+        try:
+            storage.touch_user(message.from_user.id, source)
+        except Exception:
+            logger.exception("Не удалось сохранить источник")
+    _log(message.from_user.id, "start")
+    await message.answer(_help_text(), reply_markup=_start_kb())
 
 
 @dp.message(Command("help"))
 async def cmd_help(message: Message):
-    await message.answer(HELP_TEXT)
+    await message.answer(_help_text(), reply_markup=_start_kb())
+
+
+# ---------------------------------------------------------------------------
+# /stats — только для владельца (ADMIN_ID в .env)
+# ---------------------------------------------------------------------------
+
+@dp.message(Command("stats"))
+async def cmd_stats(message: Message, command: CommandObject):
+    if not ADMIN_ID or message.from_user.id != ADMIN_ID:
+        return
+    days = 7
+    if command.args and command.args.strip().isdigit():
+        days = max(1, min(int(command.args.strip()), 365))
+    s = storage.stats(days)
+    lines = [
+        f"<b>Статистика за {days} дн.</b>",
+        f"Всего пользователей: {s['total']}",
+        f"Новых: {s['new']}",
+        f"Активных: {s['active']}",
+        "",
+        "<b>Источники новых:</b>",
+    ]
+    lines += [f"{src}: {cnt}" for src, cnt in s["sources"]] or ["—"]
+    lines += ["", "<b>Действия:</b>"]
+    lines += [f"{kind}: {cnt}" for kind, cnt in s["events"]] or ["—"]
+    await message.answer("\n".join(lines))
 
 
 # ---------------------------------------------------------------------------
@@ -142,14 +254,7 @@ _GOAL_MAP = {
 _TWO_NUM_RE = re.compile(r"^\s*(-?\d+[.,]?\d*)\s*(?:[xх×на/]\s*)?(-?\d+[.,]?\d*)\s*$", re.IGNORECASE)
 
 
-async def _send_1rm(message: Message, weight: float, reps_f: float):
-    reps = int(round(reps_f))
-    try:
-        r = calc.calc_1rm(weight, reps)
-    except ValueError as e:
-        await message.answer(f"⚠️ {e}")
-        return
-
+def _format_1rm(weight: float, reps: int, r: calc.OneRMResult) -> str:
     lines = [f"<b>{weight:g} кг × {reps}</b>"]
     lines.append(f"1RM (Epley): {r.epley:.1f} кг")
     lines.append(f"1RM (Brzycki): {r.brzycki:.1f} кг")
@@ -161,6 +266,16 @@ async def _send_1rm(message: Message, weight: float, reps_f: float):
     lines.append("<b>Рабочие веса:</b>")
     for pct, w in r.table:
         lines.append(f"{pct}% — {w:g} кг")
+    return "\n".join(lines)
+
+
+async def _send_1rm(message: Message, weight: float, reps_f: float):
+    reps = int(round(reps_f))
+    try:
+        r = calc.calc_1rm(weight, reps)
+    except ValueError as e:
+        await message.answer(f"⚠️ {e}")
+        return
 
     _LAST_RESULT[message.from_user.id] = {
         "kind": "1rm",
@@ -169,7 +284,8 @@ async def _send_1rm(message: Message, weight: float, reps_f: float):
         "average": r.average,
         "table": r.table,
     }
-    await message.answer("\n".join(lines), reply_markup=_card_button("1rm"))
+    _log(message.from_user.id, "1rm")
+    await message.answer(_format_1rm(weight, reps, r), reply_markup=_result_kb("1rm"))
 
 
 @dp.message(Command("rm"))
@@ -198,6 +314,50 @@ async def quick_1rm(message: Message):
     except ValueError:
         return
     await _send_1rm(message, weight, reps)
+
+
+# ---------------------------------------------------------------------------
+# Inline-режим: "@bot 100 8" в любом чате. Нужно один раз включить
+# в BotFather: /setinline -> выбрать бота -> подсказка "вес повторы".
+# Это главный канал "сарафана": результат уходит в чат друга с подписью бота.
+# ---------------------------------------------------------------------------
+
+@dp.inline_query()
+async def inline_1rm(query: InlineQuery):
+    m = _TWO_NUM_RE.match(query.query or "")
+    results = []
+    if m:
+        try:
+            weight = calc.parse_number(m.group(1))
+            reps = int(round(calc.parse_number(m.group(2))))
+            r = calc.calc_1rm(weight, reps)
+        except ValueError:
+            r = None
+        if r:
+            text = _format_1rm(weight, reps, r) + f"\n\nПосчитано в @{BOT_USERNAME}"
+            results.append(
+                InlineQueryResultArticle(
+                    id=f"1rm:{weight:g}:{reps}",
+                    title=f"Максимум ≈ {r.average:.1f} кг",
+                    description=f"{weight:g} кг × {reps} → 1RM и рабочие веса по %",
+                    input_message_content=InputTextMessageContent(
+                        message_text=text, parse_mode=ParseMode.HTML
+                    ),
+                )
+            )
+            _log(query.from_user.id, "inline")
+    if not results:
+        results.append(
+            InlineQueryResultArticle(
+                id="hint",
+                title="Напиши вес и повторы, например: 100 8",
+                description="Посчитаю разовый максимум и рабочие веса",
+                input_message_content=InputTextMessageContent(
+                    message_text=f"Считаю разовый максимум по подходу: @{BOT_USERNAME}"
+                ),
+            )
+        )
+    await query.answer(results, cache_time=60, is_personal=False)
 
 
 # ---------------------------------------------------------------------------
@@ -242,7 +402,8 @@ async def _strength_score(message: Message, kind: str):
         "sub_value": f"{bw:g} кг · сумма {total:g} кг",
         "gauge": _STRENGTH_GAUGE,
     }
-    await message.answer(text, reply_markup=_card_button(kind))
+    _log(message.from_user.id, kind)
+    await message.answer(text, reply_markup=_result_kb(kind))
 
 
 @dp.message(Command("dots"))
@@ -288,7 +449,8 @@ async def cmd_ffmi(message: Message):
         "sub_value": r.verdict,
         "gauge": _FFMI_GAUGE,
     }
-    await message.answer(text, reply_markup=_card_button("ffmi"))
+    _log(message.from_user.id, "ffmi")
+    await message.answer(text, reply_markup=_result_kb("ffmi"))
 
 
 # ---------------------------------------------------------------------------
@@ -314,6 +476,15 @@ async def cmd_kbju(message: Message):
         if goal_raw not in _GOAL_MAP:
             raise ValueError("Цель: сушка/поддержание/масса")
         goal = _GOAL_MAP[goal_raw]
+        # Миффлин-Сан Жеор выведена на взрослых, а дефицит калорий растущему
+        # организму без врача давать нельзя — поэтому до 18 лет "сушку"
+        # не считаем, показываем поддержание с объяснением.
+        teen_note = ""
+        if age < 18:
+            teen_note = "\n\n⚠️ Формула рассчитана на взрослых — до 18 лет это лишь грубый ориентир."
+            if goal == "cut":
+                goal = "maintain"
+                teen_note += " Дефицит калорий подросткам без врача не считаю — показал поддержание."
         r = calc.calc_kbju(sex, age, height, weight, activity, goal)
     except ValueError as e:
         await message.answer(f"⚠️ {e}")
@@ -325,6 +496,7 @@ async def cmd_kbju(message: Message):
         f"Белки: {r.protein_g:.0f} г\n"
         f"Жиры: {r.fat_g:.0f} г\n"
         f"Углеводы: {r.carbs_g:.0f} г"
+        f"{teen_note}"
     )
     _LAST_RESULT[message.from_user.id] = {
         "kind": "kbju",
@@ -334,7 +506,8 @@ async def cmd_kbju(message: Message):
         "carbs": r.carbs_g,
         "goal_label": r.goal_label,
     }
-    await message.answer(text, reply_markup=_card_button("kbju"))
+    _log(message.from_user.id, "kbju")
+    await message.answer(text, reply_markup=_result_kb("kbju"))
 
 
 # ---------------------------------------------------------------------------
@@ -345,9 +518,7 @@ async def cmd_kbju(message: Message):
 async def cmd_rpe(message: Message):
     args = _args(message)
     if len(args) != 3:
-        await message.answer(
-            "Формат: <code>/rpe 140 3 8</code> (вес, повторы, RPE от 6 до 10)"
-        )
+        await message.answer("Формат: <code>/rpe 140 3 8</code> (вес, повторы, RPE от 6 до 10)")
         return
     try:
         weight = calc.parse_number(args[0])
@@ -367,7 +538,8 @@ async def cmd_rpe(message: Message):
     for rpe_val, w in r.projection:
         lines.append(f"RPE {rpe_val:g} — {w:g} кг")
 
-    await message.answer("\n".join(lines))
+    _log(message.from_user.id, "rpe")
+    await message.answer("\n".join(lines), reply_markup=_start_kb())
 
 
 # ---------------------------------------------------------------------------
@@ -398,7 +570,44 @@ async def cmd_warmup(message: Message):
         else:
             lines.append(f"<b>{step.label}: {step.weight:g} кг</b>")
 
-    await message.answer("\n".join(lines))
+    _log(message.from_user.id, "warmup")
+    await message.answer("\n".join(lines), reply_markup=_start_kb())
+
+
+# ---------------------------------------------------------------------------
+# Разряд ЕВСК (классическое троеборье, без экипировки)
+# ---------------------------------------------------------------------------
+
+@dp.message(Command("rank"))
+async def cmd_rank(message: Message):
+    args = _args(message)
+    if len(args) != 3:
+        await message.answer("Формат: <code>/rank м 90 500</code> (пол, вес атлета, сумма троеборья)")
+        return
+    try:
+        sex = _norm_sex(args[0])
+        bw = calc.parse_number(args[1])
+        total = calc.parse_number(args[2])
+        r = calc.calc_rank(sex, bw, total)
+    except ValueError as e:
+        await message.answer(f"⚠️ {e}")
+        return
+
+    lines = [f"<b>Весовая категория: до {r.weight_class} кг</b>"]
+    if r.rank == "нет разряда":
+        lines.append("Норматив ниже III юношеского — официального разряда пока нет")
+    else:
+        lines.append(f"<b>Разряд: {r.rank}</b>")
+    if r.next_rank:
+        lines.append(f"До «{r.next_rank}» не хватает {r.gap_to_next:.1f} кг")
+    lines.append("")
+    lines.append(
+        "<i>Классическое троеборье (без экипировки), ЕВСК с учётом поправок 2023-2024 гг. "
+        "Разряд присваивается по официальному протоколу соревнований — здесь только ориентир.</i>"
+    )
+
+    _log(message.from_user.id, "rank")
+    await message.answer("\n".join(lines), reply_markup=_start_kb())
 
 
 # ---------------------------------------------------------------------------
@@ -413,16 +622,14 @@ async def make_card(callback: CallbackQuery):
         return
 
     kind = data["kind"]
+    brand = _brand()
     if kind == "1rm":
-        png = cards.card_1rm(data["weight"], data["reps"], data["average"], data["table"], brand=BRAND)
-    elif kind in ("dots", "wilks"):
+        png = cards.card_1rm(data["weight"], data["reps"], data["average"], data["table"], brand=brand)
+    elif kind in ("dots", "wilks", "ffmi"):
         png = cards.card_score(data["label"], data["score"], data["sub_label"], data["sub_value"],
-                                brand=BRAND, gauge=data.get("gauge"))
-    elif kind == "ffmi":
-        png = cards.card_score(data["label"], data["score"], data["sub_label"], data["sub_value"],
-                                brand=BRAND, gauge=data.get("gauge"))
+                               brand=brand, gauge=data.get("gauge"))
     elif kind == "kbju":
-        png = cards.card_kbju(data["target"], data["protein"], data["fat"], data["carbs"], data["goal_label"], brand=BRAND)
+        png = cards.card_kbju(data["target"], data["protein"], data["fat"], data["carbs"], data["goal_label"], brand=brand)
     else:
         await callback.answer("Неизвестный тип", show_alert=True)
         return
@@ -431,7 +638,12 @@ async def make_card(callback: CallbackQuery):
     # обычные фото (падает резкость текста на карточке), а документ уходит
     # без потери качества — то, что нужно для карточки под соцсети.
     photo = BufferedInputFile(png, filename="card.png")
-    await callback.message.answer_document(photo)
+    _log(callback.from_user.id, f"card_{kind}")
+    await callback.message.answer_document(
+        photo,
+        caption="Перешли другу — пусть посчитает свой 👇",
+        reply_markup=_share_kb(),
+    )
     await callback.answer()
 
 
@@ -459,14 +671,21 @@ BOT_COMMANDS = [
     BotCommand(command="kbju", description="🍗 КБЖУ: пол, возраст, рост, вес, активность, цель"),
     BotCommand(command="rpe", description="🔥 Оценка 1ПМ по RPE: вес, повторы, RPE"),
     BotCommand(command="warmup", description="🔧 Разминка до рабочего веса"),
+    BotCommand(command="rank", description="🏅 Разряд ЕВСК по сумме троеборья"),
     BotCommand(command="help", description="ℹ️ Как пользоваться ботом"),
 ]
 
 
 async def main():
+    global BOT_USERNAME
     if not TOKEN:
         raise SystemExit("Не найден BOT_TOKEN. Положи его в .env (см. README.md)")
+    storage.init(DB_PATH)
+    dp.update.outer_middleware(TrackUsersMiddleware())
     bot = Bot(token=TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+    me = await bot.get_me()
+    BOT_USERNAME = me.username
+    logger.info("Бот @%s, канал @%s, БД %s", BOT_USERNAME, CHANNEL, DB_PATH)
     await bot.set_my_commands(BOT_COMMANDS)
     await dp.start_polling(bot)
 
