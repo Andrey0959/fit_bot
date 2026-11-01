@@ -73,7 +73,8 @@ class Space:
     GRID = 54
     HEADER_RULE = 50      # от верхнего поля до жирной линейки шапки
     AFTER_HEADER = 40
-    HERO_TO_CONTEXT = 64
+    HERO_TOP = 48         # от линейки шапки до верха цифр
+    HERO_TO_CONTEXT = 72
     BLOCK = 24            # между блоками
     LINE_CONTEXT = 46     # межстрочный у контекста
     ROW = 66
@@ -122,6 +123,7 @@ class Page:
         self.left = S.MARGIN
         self.right = S.W - S.MARGIN
         self.width = self.right - self.left
+        self.code = code
         self._grid()
         self._header(code, date or today())
 
@@ -170,8 +172,9 @@ class Page:
         while size > Size.HERO_MIN and self.d.textlength(prefix + value, font=font(Font.MONO_BOLD, size)) > self.width - unit_w:
             size -= 6
         f = font(Font.MONO_BOLD, size)
-        ascent, _ = f.getmetrics()
-        base = self.y + ascent
+        # ставим по реальной высоте цифр, а не по «воздуху» шрифта над ними
+        cap = -f.getbbox("0", anchor="ls")[1]
+        base = self.y + Space.HERO_TOP + cap
         x = self.left - 8
         self.d.text((x, base), prefix + value, font=f, fill=Color.INK, anchor="ls")
         end = x + self.d.textlength(prefix + value, font=f)
@@ -255,6 +258,8 @@ class Page:
         self.y = top + h + 10 + 30 + Space.BLOCK
 
     def footer(self, right: str | None = None, right_color: str = Color.MUTED):
+        if self.overflow:
+            log.warning("Карточка %s: контент налез на подвал (y=%d)", self.code, self.y)
         f = font(Font.MONO, Size.FOOTER)
         y = Space.H - Space.MARGIN - 24
         self.d.text((self.left, y), CHANNEL, font=f, fill=Color.MUTED)
