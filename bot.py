@@ -3,6 +3,7 @@
 Карманный математический инженер для зала.
 Стек: aiogram 3.x, python-dotenv, Pillow (карточки), sqlite3 (аналитика).
 
+Тон текстов: коротко, по делу, без эмодзи. Цифра — первой строкой.
 Запуск: см. README.md
 """
 
@@ -34,7 +35,9 @@ from dotenv import load_dotenv
 
 import calculators as calc
 import cards
+import design
 import storage
+from design import num
 
 load_dotenv()
 TOKEN = os.getenv("BOT_TOKEN")
@@ -42,9 +45,9 @@ CHANNEL = os.getenv("CHANNEL", "thirstforfame1").lstrip("@")
 CHANNEL_URL = f"https://t.me/{CHANNEL}"
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0") or 0)  # свой user_id — для /stats
 DB_PATH = os.getenv("DB_PATH", "bot.db")
+design.CHANNEL = f"t.me/{CHANNEL}"  # подпись в подвале карточек
 
-# Заполняется при старте из bot.get_me(), чтобы не хардкодить username:
-# сменил бота в BotFather — подпись на карточках поменялась сама.
+# Заполняется при старте из bot.get_me(): сменил бота в BotFather — ссылки поменялись сами.
 BOT_USERNAME = ""
 
 _log_handlers: list[logging.Handler] = [logging.StreamHandler()]  # консоль / логи хостинга
@@ -66,51 +69,41 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 dp = Dispatcher()
 
-# В памяти храним последний результат каждого юзера, чтобы по кнопке
-# "Сделать карточку" не пересчитывать и не гонять данные через callback_data
-# (там лимит 64 байта). Никакой персистентности, всё живёт до рестарта.
+# Последний результат каждого пользователя: функция, которая рисует его карточку.
+# Только в памяти, до рестарта — callback_data ограничен 64 байтами.
 _LAST_RESULT: dict[int, dict] = {}
 
 
-def _brand() -> str:
-    """Подпись в подвале карточки: канал + бот, чтобы по пересланной
-    картинке можно было найти и то и другое."""
-    return f"@{CHANNEL} · @{BOT_USERNAME}" if BOT_USERNAME else f"@{CHANNEL}"
-
+# ---------------------------------------------------------------------------
+# Кнопки. Один стиль: глагол или существительное, без эмодзи.
+# ---------------------------------------------------------------------------
 
 def _channel_row() -> list[InlineKeyboardButton]:
-    return [InlineKeyboardButton(text="📢 Канал: разборы и программы", url=CHANNEL_URL)]
+    return [InlineKeyboardButton(text="Канал: разборы и программы", url=CHANNEL_URL)]
 
 
 def _result_kb(kind: str) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text="🖼 Сделать карточку", callback_data=f"card:{kind}")],
-            _channel_row(),
-        ]
-    )
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="Карточка", callback_data=f"card:{kind}")],
+        _channel_row(),
+    ])
 
 
 def _start_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[_channel_row()])
 
 
-def _share_kb() -> InlineKeyboardMarkup:
-    """Под карточкой: подпись зовёт друга посчитать свой — значит первая
-    кнопка должна вести в бота, а не только в канал."""
-    rows = []
+def _card_kb(kind: str) -> InlineKeyboardMarkup:
+    """Под карточкой: оригинал без сжатия, позвать друга, канал."""
+    rows = [[InlineKeyboardButton(text="Файл без сжатия", callback_data=f"file:{kind}")]]
     if BOT_USERNAME:
-        rows.append([InlineKeyboardButton(
-            text="🧮 Посчитать свой", url=f"https://t.me/{BOT_USERNAME}?start=card"
-        )])
+        rows.append([InlineKeyboardButton(text="Посчитать свой", url=f"https://t.me/{BOT_USERNAME}?start=card")])
     rows.append(_channel_row())
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-# Ориентировочные шкалы уровня для карточек (DOTS/Wilks и FFMI) — для
-# наглядности, не строгая классификация федераций.
-_STRENGTH_GAUGE = {"min": 100, "max": 600, "labels": ["Новичок", "Любитель", "Продвинутый", "Элита", "Топ"]}
-_FFMI_GAUGE = {"min": 15, "max": 28, "labels": ["Низкий", "Средний", "Хороший", "Предел", "Выше"]}
+def _remember(user_id: int, kind: str, render: Callable[[], bytes]) -> None:
+    _LAST_RESULT[user_id] = {"kind": kind, "render": render}
 
 
 # ---------------------------------------------------------------------------
@@ -146,35 +139,26 @@ def _log(user_id: int, kind: str) -> None:
 # ---------------------------------------------------------------------------
 
 HELP_TEXT = (
-    "🏋️ <b>Карманный математический инженер для зала</b>\n"
-    "<i>Кидаешь цифры между подходами — получаешь готовую математику. Без сайтов, без регистраций.</i>\n\n"
-    "━━━━━━━━━━━━━━━\n\n"
-    "💪 <b>Разовый максимум + раскладка по %</b>\n"
-    "Просто напиши: <code>100 8</code>\n"
-    "<i>(вес и повторы — без команды, самый быстрый путь)</i>\n\n"
-    "⚖️ <b>DOTS</b> — сила с поправкой на вес тела\n"
-    "<code>/dots м 90 500</code>\n"
-    "<i>(пол, вес атлета, сумма/вес на штанге)</i>\n\n"
-    "🏆 <b>Wilks</b> — старый привычный коэффициент\n"
+    "<b>Карманный математический инженер для зала</b>\n"
+    "Цифры между подходами — готовая математика. Без сайтов и регистрации.\n\n"
+    "<b>Разовый максимум и рабочие веса</b>\n"
+    "<code>100 8</code> — вес и повторы, без команды\n\n"
+    "<b>RPE</b> — максимум по тяжести подхода\n"
+    "<code>/rpe 140 3 8</code> — вес, повторы, RPE 6–10\n\n"
+    "<b>Разминка</b> — подходы до рабочего веса\n"
+    "<code>/warmup 140</code> — рабочий вес; гриф вторым числом\n\n"
+    "<b>DOTS и Wilks</b> — сила с поправкой на вес тела\n"
+    "<code>/dots м 90 500</code> — пол, вес тела, сумма\n"
     "<code>/wilks ж 62.5 280</code>\n\n"
-    "📏 <b>FFMI</b> — индекс сухой массы\n"
-    "<code>/ffmi 180 85 15</code>\n"
-    "<i>(рост см, вес кг, % жира)</i>\n\n"
-    "🍗 <b>КБЖУ</b> — калории и БЖУ (Миффлин-Сан Жеор)\n"
+    "<b>Разряд ЕВСК</b> — классическое троеборье\n"
+    "<code>/rank м 90 500</code> — пол, вес тела, сумма\n\n"
+    "<b>FFMI</b> — индекс сухой массы\n"
+    "<code>/ffmi 180 85 15</code> — рост, вес, % жира\n\n"
+    "<b>КБЖУ</b> — калории и БЖУ на день\n"
     "<code>/kbju м 30 180 85 3 сушка</code>\n"
-    "<i>(пол, возраст, рост см, вес кг, активность 1-5, цель)</i>\n\n"
-    "🔥 <b>RPE</b> — оценка 1ПМ по тяжести подхода\n"
-    "<code>/rpe 140 3 8</code>\n"
-    "<i>(вес, повторы, RPE от 6 до 10)</i>\n\n"
-    "🔧 <b>Разминка</b> — лестница до рабочего веса\n"
-    "<code>/warmup 140</code>\n"
-    "<i>(рабочий вес; свой гриф — вторым числом)</i>\n\n"
-    "🏅 <b>Разряд ЕВСК</b> — по сумме троеборья и весу\n"
-    "<code>/rank м 90 500</code>\n"
-    "<i>(пол, вес атлета, сумма троеборья)</i>\n\n"
-    "━━━━━━━━━━━━━━━\n"
-    "Дробные — через точку или запятую: <code>82.5</code> или <code>82,5</code>.\n\n"
-    "💡 Считать можно прямо в любом чате: напиши <code>@{bot} 100 8</code>"
+    "пол, возраст, рост, вес, активность 1–5, цель: сушка / поддержание / масса\n\n"
+    "Дробные — через точку или запятую. К каждому результату — кнопка «Карточка».\n"
+    "В любом чате: <code>@{bot} 100 8</code>"
 )
 
 
@@ -218,16 +202,16 @@ async def cmd_stats(message: Message, command: CommandObject):
         f"Новых: {s['new']}",
         f"Активных: {s['active']}",
         "",
-        "<b>Источники новых:</b>",
+        "<b>Источники новых</b>",
     ]
     lines += [f"{src}: {cnt}" for src, cnt in s["sources"]] or ["—"]
-    lines += ["", "<b>Действия:</b>"]
+    lines += ["", "<b>Действия</b>"]
     lines += [f"{kind}: {cnt}" for kind, cnt in s["events"]] or ["—"]
     await message.answer("\n".join(lines))
 
 
 # ---------------------------------------------------------------------------
-# Утилита разбора аргументов команды
+# Разбор аргументов
 # ---------------------------------------------------------------------------
 
 def _args(message: Message) -> list[str]:
@@ -243,7 +227,17 @@ def _norm_sex(raw: str) -> str:
         return "m"
     if raw in ("ж", "f", "жен", "female"):
         return "f"
-    raise ValueError("Пол укажи как м/ж")
+    raise ValueError("пол укажи как м или ж")
+
+
+def _fail(text: str) -> str:
+    """Единый вид ошибки ввода."""
+    t = text.strip().rstrip(".")
+    return f"Не получилось: {t[:1].lower() + t[1:]}."
+
+
+def _usage(example: str, hint: str) -> str:
+    return f"Формат: <code>{example}</code>\n{hint}"
 
 
 _GOAL_MAP = {
@@ -260,51 +254,48 @@ _GOAL_MAP = {
 _TWO_NUM_RE = re.compile(r"^\s*(-?\d+[.,]?\d*)\s*(?:[xх×на/]\s*)?(-?\d+[.,]?\d*)\s*$", re.IGNORECASE)
 
 
-def _format_1rm(weight: float, reps: int, r: calc.OneRMResult) -> str:
-    lines = [f"<b>{weight:g} кг × {reps}</b>"]
-    lines.append(f"1RM (Epley): {r.epley:.1f} кг")
-    lines.append(f"1RM (Brzycki): {r.brzycki:.1f} кг")
-    lines.append(f"1RM (Lombardi): {r.lombardi:.1f} кг")
-    lines.append(f"<b>Среднее: {r.average:.1f} кг</b>")
+def _format_1rm(r: calc.OneRMResult) -> str:
+    lines = [
+        f"<b>1RM ≈ {num(r.average)} кг</b>",
+        f"Подход: {num(r.weight)} кг × {r.reps}",
+        "",
+        f"Epley — {num(r.epley)} кг",
+        f"Brzycki — {num(r.brzycki)} кг",
+        f"Lombardi — {num(r.lombardi)} кг",
+    ]
     if not r.reliable:
-        lines.append("⚠️ При {}+ повторах формулы врут сильнее — бери с запасом.".format(13))
-    lines.append("")
-    lines.append("<b>Рабочие веса:</b>")
-    for pct, w in r.table:
-        lines.append(f"{pct}% — {w:g} кг")
+        lines.append("13+ повторов: формулы врут сильнее, бери с запасом.")
+    lines += ["", "<b>Рабочие веса</b>"]
+    lines += [f"{pct}% — {num(w)} кг" for pct, w in r.table]
     return "\n".join(lines)
 
 
 async def _send_1rm(message: Message, weight: float, reps_f: float):
     reps = int(round(reps_f))
+    if reps >= 37:  # формула Brzycki делит на (37 - повторы)
+        await message.answer(_fail("для 37+ повторов разовый максимум не считается"))
+        return
     try:
         r = calc.calc_1rm(weight, reps)
     except ValueError as e:
-        await message.answer(f"⚠️ {e}")
+        await message.answer(_fail(str(e)))
         return
-
-    _LAST_RESULT[message.from_user.id] = {
-        "kind": "1rm",
-        "weight": weight,
-        "reps": reps,
-        "average": r.average,
-        "table": r.table,
-    }
+    _remember(message.from_user.id, "1rm", lambda: cards.card_1rm(r))
     _log(message.from_user.id, "1rm")
-    await message.answer(_format_1rm(weight, reps, r), reply_markup=_result_kb("1rm"))
+    await message.answer(_format_1rm(r), reply_markup=_result_kb("1rm"))
 
 
 @dp.message(Command("rm"))
 async def cmd_rm(message: Message):
     args = _args(message)
     if len(args) != 2:
-        await message.answer("Формат: <code>/rm 100 8</code> (вес, повторы)")
+        await message.answer(_usage("/rm 100 8", "вес, повторы"))
         return
     try:
         weight = calc.parse_number(args[0])
         reps = calc.parse_number(args[1])
     except ValueError:
-        await message.answer("Не смог разобрать числа. Пример: <code>/rm 100 8</code>")
+        await message.answer(_fail("не разобрал числа. Пример: /rm 100 8"))
         return
     await _send_1rm(message, weight, reps)
 
@@ -323,9 +314,8 @@ async def quick_1rm(message: Message):
 
 
 # ---------------------------------------------------------------------------
-# Inline-режим: "@bot 100 8" в любом чате. Нужно один раз включить
-# в BotFather: /setinline -> выбрать бота -> подсказка "вес повторы".
-# Это главный канал "сарафана": результат уходит в чат друга с подписью бота.
+# Inline-режим: "@bot 100 8" в любом чате. Включается в BotFather: /setinline.
+# Главный канал «сарафана»: результат уходит в чат друга с подписью бота.
 # ---------------------------------------------------------------------------
 
 @dp.inline_query()
@@ -340,15 +330,13 @@ async def inline_1rm(query: InlineQuery):
         except ValueError:
             r = None
         if r:
-            text = _format_1rm(weight, reps, r) + f"\n\nПосчитано в @{BOT_USERNAME}"
+            text = _format_1rm(r) + f"\n\nПосчитано в @{BOT_USERNAME}"
             results.append(
                 InlineQueryResultArticle(
                     id=f"1rm:{weight:g}:{reps}",
-                    title=f"Максимум ≈ {r.average:.1f} кг",
-                    description=f"{weight:g} кг × {reps} → 1RM и рабочие веса по %",
-                    input_message_content=InputTextMessageContent(
-                        message_text=text, parse_mode=ParseMode.HTML
-                    ),
+                    title=f"1RM ≈ {num(r.average)} кг",
+                    description=f"{num(weight)} кг × {reps} — максимум и рабочие веса",
+                    input_message_content=InputTextMessageContent(message_text=text, parse_mode=ParseMode.HTML),
                 )
             )
             _log(query.from_user.id, "inline")
@@ -356,10 +344,10 @@ async def inline_1rm(query: InlineQuery):
         results.append(
             InlineQueryResultArticle(
                 id="hint",
-                title="Напиши вес и повторы, например: 100 8",
+                title="Вес и повторы, например: 100 8",
                 description="Посчитаю разовый максимум и рабочие веса",
                 input_message_content=InputTextMessageContent(
-                    message_text=f"Считаю разовый максимум по подходу: @{BOT_USERNAME}"
+                    message_text=f"Разовый максимум по подходу: @{BOT_USERNAME}"
                 ),
             )
         )
@@ -373,41 +361,26 @@ async def inline_1rm(query: InlineQuery):
 async def _strength_score(message: Message, kind: str):
     args = _args(message)
     if len(args) != 3:
-        name = "dots" if kind == "dots" else "wilks"
-        await message.answer(f"Формат: <code>/{name} м 90 500</code> (пол, вес атлета, сумма на штанге)")
+        await message.answer(_usage(f"/{kind} м 90 500", "пол, вес тела, сумма"))
         return
     try:
         sex = _norm_sex(args[0])
         bw = calc.parse_number(args[1])
         total = calc.parse_number(args[2])
+        dots = calc.calc_dots(sex, bw, total)
+        wilks = calc.calc_wilks(sex, bw, total)
     except ValueError as e:
-        await message.answer(f"⚠️ {e}")
+        await message.answer(_fail(str(e)))
         return
 
-    try:
-        if kind == "dots":
-            score = calc.calc_dots(sex, bw, total)
-            label = "DOTS"
-        else:
-            score = calc.calc_wilks(sex, bw, total)
-            label = "Wilks"
-    except ValueError as e:
-        await message.answer(f"⚠️ {e}")
-        return
-
-    sex_label = "мужчины" if sex == "m" else "женщины"
+    main, other = (("DOTS", dots), ("Wilks", wilks)) if kind == "dots" else (("Wilks", wilks), ("DOTS", dots))
+    sex_label = "мужчина" if sex == "m" else "женщина"
     text = (
-        f"<b>{label}: {score:.1f}</b>\n"
-        f"Вес атлета: {bw:g} кг · Сумма: {total:g} кг · {sex_label}"
+        f"<b>{main[0]} {num(main[1])}</b>\n"
+        f"{sex_label.capitalize()} · вес тела {num(bw)} кг · сумма {num(total)} кг\n"
+        f"{other[0]} — {num(other[1])}"
     )
-    _LAST_RESULT[message.from_user.id] = {
-        "kind": kind,
-        "score": score,
-        "label": label,
-        "sub_label": "Атлет",
-        "sub_value": f"{bw:g} кг · сумма {total:g} кг",
-        "gauge": _STRENGTH_GAUGE,
-    }
+    _remember(message.from_user.id, kind, lambda: cards.card_strength(sex, bw, total, dots, wilks, kind))
     _log(message.from_user.id, kind)
     await message.answer(text, reply_markup=_result_kb(kind))
 
@@ -430,7 +403,7 @@ async def cmd_wilks(message: Message):
 async def cmd_ffmi(message: Message):
     args = _args(message)
     if len(args) != 3:
-        await message.answer("Формат: <code>/ffmi 180 85 15</code> (рост см, вес кг, % жира)")
+        await message.answer(_usage("/ffmi 180 85 15", "рост в см, вес в кг, % жира"))
         return
     try:
         height = calc.parse_number(args[0])
@@ -438,23 +411,16 @@ async def cmd_ffmi(message: Message):
         bf = calc.parse_number(args[2])
         r = calc.calc_ffmi(height, weight, bf)
     except ValueError as e:
-        await message.answer(f"⚠️ {e}")
+        await message.answer(_fail(str(e)))
         return
 
     text = (
-        f"<b>FFMI: {r.ffmi:.1f}</b> (норм. {r.normalized_ffmi:.1f})\n"
-        f"Сухая масса: {r.lean_mass:.1f} кг\n"
-        f"{r.verdict}\n\n"
-        f"⚠️ Точность впрямую зависит от точности % жира — если мерил на глаз, погрешность может съесть выводы."
+        f"<b>FFMI {num(r.normalized_ffmi)}</b> (без поправки на рост {num(r.ffmi)})\n"
+        f"Сухая масса — {num(r.lean_mass)} кг\n"
+        f"{r.verdict.capitalize()}.\n\n"
+        f"Точность упирается в замер % жира: на глаз — плюс-минус несколько единиц."
     )
-    _LAST_RESULT[message.from_user.id] = {
-        "kind": "ffmi",
-        "score": r.normalized_ffmi,
-        "label": "FFMI (норм.)",
-        "sub_label": "Вывод",
-        "sub_value": r.verdict,
-        "gauge": _FFMI_GAUGE,
-    }
+    _remember(message.from_user.id, "ffmi", lambda: cards.card_ffmi(height, weight, bf, r))
     _log(message.from_user.id, "ffmi")
     await message.answer(text, reply_markup=_result_kb("ffmi"))
 
@@ -467,10 +433,10 @@ async def cmd_ffmi(message: Message):
 async def cmd_kbju(message: Message):
     args = _args(message)
     if len(args) != 6:
-        await message.answer(
-            "Формат: <code>/kbju м 30 180 85 3 сушка</code>\n"
-            "(пол, возраст, рост см, вес кг, активность 1-5, цель: сушка/поддержание/масса)"
-        )
+        await message.answer(_usage(
+            "/kbju м 30 180 85 3 сушка",
+            "пол, возраст, рост, вес, активность 1–5, цель: сушка / поддержание / масса",
+        ))
         return
     try:
         sex = _norm_sex(args[0])
@@ -480,38 +446,31 @@ async def cmd_kbju(message: Message):
         activity = int(calc.parse_number(args[4]))
         goal_raw = args[5].strip().lower()
         if goal_raw not in _GOAL_MAP:
-            raise ValueError("Цель: сушка/поддержание/масса")
+            raise ValueError("цель — сушка, поддержание или масса")
         goal = _GOAL_MAP[goal_raw]
         # Миффлин-Сан Жеор выведена на взрослых, а дефицит калорий растущему
-        # организму без врача давать нельзя — поэтому до 18 лет "сушку"
+        # организму без врача давать нельзя — поэтому до 18 лет «сушку»
         # не считаем, показываем поддержание с объяснением.
-        teen_note = ""
+        teen_note = None
         if age < 18:
-            teen_note = "\n\n⚠️ Формула рассчитана на взрослых — до 18 лет это лишь грубый ориентир."
+            teen_note = "До 18 лет — грубый ориентир."
             if goal == "cut":
                 goal = "maintain"
-                teen_note += " Дефицит калорий подросткам без врача не считаю — показал поддержание."
+                teen_note += " Дефицит без врача не считаю: показано поддержание."
         r = calc.calc_kbju(sex, age, height, weight, activity, goal)
     except ValueError as e:
-        await message.answer(f"⚠️ {e}")
+        await message.answer(_fail(str(e)))
         return
 
     text = (
-        f"<b>{r.target_kcal:.0f} ккал/день</b> — {r.goal_label}\n"
-        f"BMR: {r.bmr:.0f} · TDEE: {r.tdee:.0f} · {r.activity_label}\n\n"
-        f"Белки: {r.protein_g:.0f} г\n"
-        f"Жиры: {r.fat_g:.0f} г\n"
-        f"Углеводы: {r.carbs_g:.0f} г"
-        f"{teen_note}"
+        f"<b>{num(r.target_kcal, 0)} ккал в день</b> — {r.goal_label}\n"
+        f"Белки {num(r.protein_g, 0)} г · жиры {num(r.fat_g, 0)} г · углеводы {num(r.carbs_g, 0)} г\n\n"
+        f"В покое — {num(r.bmr, 0)} ккал, с активностью — {num(r.tdee, 0)} ккал\n"
+        f"Активность: {r.activity_label}"
     )
-    _LAST_RESULT[message.from_user.id] = {
-        "kind": "kbju",
-        "target": r.target_kcal,
-        "protein": r.protein_g,
-        "fat": r.fat_g,
-        "carbs": r.carbs_g,
-        "goal_label": r.goal_label,
-    }
+    if teen_note:
+        text += f"\n\n{teen_note}"
+    _remember(message.from_user.id, "kbju", lambda: cards.card_kbju(weight, r, teen_note))
     _log(message.from_user.id, "kbju")
     await message.answer(text, reply_markup=_result_kb("kbju"))
 
@@ -524,7 +483,7 @@ async def cmd_kbju(message: Message):
 async def cmd_rpe(message: Message):
     args = _args(message)
     if len(args) != 3:
-        await message.answer("Формат: <code>/rpe 140 3 8</code> (вес, повторы, RPE от 6 до 10)")
+        await message.answer(_usage("/rpe 140 3 8", "вес, повторы, RPE от 6 до 10"))
         return
     try:
         weight = calc.parse_number(args[0])
@@ -532,20 +491,20 @@ async def cmd_rpe(message: Message):
         rpe = calc.parse_number(args[2])
         r = calc.calc_rpe(weight, reps, rpe)
     except ValueError as e:
-        await message.answer(f"⚠️ {e}")
+        await message.answer(_fail(str(e)))
         return
 
-    lines = [f"<b>{r.weight:g} кг × {r.reps} на RPE {r.rpe_used:g}</b>"]
+    lines = [
+        f"<b>1RM ≈ {num(r.estimated_1rm)} кг</b>",
+        f"Подход: {num(r.weight)} кг × {r.reps} на RPE {num(r.rpe_used)}",
+    ]
     if r.rpe_used != r.rpe:
-        lines.append(f"(округлил RPE {r.rpe:g} → {r.rpe_used:g}, шаг таблицы — 0.5)")
-    lines.append(f"<b>Оценка 1ПМ: {r.estimated_1rm:.1f} кг</b>")
-    lines.append("")
-    lines.append(f"Тот же вес {r.reps} повторов на другой RPE:")
-    for rpe_val, w in r.projection:
-        lines.append(f"RPE {rpe_val:g} — {w:g} кг")
-
+        lines.append(f"RPE {num(r.rpe)} округлён до {num(r.rpe_used)}: шаг таблицы 0.5")
+    lines += ["", f"<b>{r.reps} повт. на другом RPE</b>"]
+    lines += [f"RPE {num(x)} — {num(w)} кг" for x, w in r.projection]
+    _remember(message.from_user.id, "rpe", lambda: cards.card_rpe(r))
     _log(message.from_user.id, "rpe")
-    await message.answer("\n".join(lines), reply_markup=_start_kb())
+    await message.answer("\n".join(lines), reply_markup=_result_kb("rpe"))
 
 
 # ---------------------------------------------------------------------------
@@ -556,39 +515,44 @@ async def cmd_rpe(message: Message):
 async def cmd_warmup(message: Message):
     args = _args(message)
     if len(args) not in (1, 2):
-        await message.answer(
-            "Формат: <code>/warmup 140</code> (рабочий вес)\n"
-            "Можно указать свой гриф: <code>/warmup 140 15</code>"
-        )
+        await message.answer(_usage("/warmup 140", "рабочий вес; свой гриф — вторым числом: /warmup 140 15"))
         return
     try:
         work_weight = calc.parse_number(args[0])
         bar_weight = calc.parse_number(args[1]) if len(args) == 2 else 20.0
         steps = calc.generate_warmup(work_weight, bar_weight)
     except ValueError as e:
-        await message.answer(f"⚠️ {e}")
+        await message.answer(_fail(str(e)))
         return
 
-    lines = [f"<b>Разминка до {work_weight:g} кг</b>"]
+    lines = [f"<b>Разминка до {num(work_weight)} кг</b>", f"Гриф {num(bar_weight)} кг", ""]
     for step in steps:
         if step.reps:
-            lines.append(f"{step.label}: {step.weight:g} кг × {step.reps}")
+            lines.append(f"{step.label} — {num(step.weight)} кг × {step.reps}")
         else:
-            lines.append(f"<b>{step.label}: {step.weight:g} кг</b>")
-
+            lines.append(f"<b>{step.label} — {num(step.weight)} кг</b>")
+    _remember(message.from_user.id, "warmup", lambda: cards.card_warmup(work_weight, bar_weight, steps))
     _log(message.from_user.id, "warmup")
-    await message.answer("\n".join(lines), reply_markup=_start_kb())
+    await message.answer("\n".join(lines), reply_markup=_result_kb("warmup"))
 
 
 # ---------------------------------------------------------------------------
 # Разряд ЕВСК (классическое троеборье, без экипировки)
 # ---------------------------------------------------------------------------
 
+def _rank_ladder(sex: str, bodyweight: float) -> list[tuple[str, float | None]]:
+    """Нормативы весовой категории — для карточки. Таблицы из calculators не меняются."""
+    table = calc._RANK_TABLE_M if sex == "m" else calc._RANK_TABLE_F
+    cats = sorted(table)
+    cat = next((c for c in cats if bodyweight <= c), cats[-1])
+    return [(name, table[cat][name]) for name in calc._RANK_ORDER]
+
+
 @dp.message(Command("rank"))
 async def cmd_rank(message: Message):
     args = _args(message)
     if len(args) != 3:
-        await message.answer("Формат: <code>/rank м 90 500</code> (пол, вес атлета, сумма троеборья)")
+        await message.answer(_usage("/rank м 90 500", "пол, вес тела, сумма троеборья"))
         return
     try:
         sex = _norm_sex(args[0])
@@ -596,89 +560,82 @@ async def cmd_rank(message: Message):
         total = calc.parse_number(args[2])
         r = calc.calc_rank(sex, bw, total)
     except ValueError as e:
-        await message.answer(f"⚠️ {e}")
+        await message.answer(_fail(str(e)))
         return
 
-    lines = [f"<b>Весовая категория: до {r.weight_class} кг</b>"]
-    if r.rank == "нет разряда":
-        lines.append("Норматив ниже III юношеского — официального разряда пока нет")
-    else:
-        lines.append(f"<b>Разряд: {r.rank}</b>")
+    head = f"<b>Разряд: {r.rank}</b>" if r.rank != "нет разряда" else "<b>Разряда пока нет</b> — ниже III юношеского"
+    lines = [head, f"Категория до {r.weight_class} кг · сумма {num(total)} кг"]
     if r.next_rank:
-        lines.append(f"До «{r.next_rank}» не хватает {r.gap_to_next:.1f} кг")
-    lines.append("")
-    lines.append(
-        "<i>Классическое троеборье (без экипировки), ЕВСК с учётом поправок 2023-2024 гг. "
-        "Разряд присваивается по официальному протоколу соревнований — здесь только ориентир.</i>"
-    )
-
+        lines.append(f"До {r.next_rank} — {num(r.gap_to_next)} кг")
+    lines += ["", "Классика, нормативы ЕВСК с поправками 2023–2024. Разряд присваивают по протоколу соревнований."]
+    ladder = _rank_ladder(sex, bw)
+    _remember(message.from_user.id, "rank", lambda: cards.card_rank(sex, bw, total, r, ladder))
     _log(message.from_user.id, "rank")
-    await message.answer("\n".join(lines), reply_markup=_start_kb())
+    await message.answer("\n".join(lines), reply_markup=_result_kb("rank"))
 
 
 # ---------------------------------------------------------------------------
-# Генерация карточки по кнопке
+# Карточка: фото для превью в чате + по кнопке — файл без сжатия
 # ---------------------------------------------------------------------------
+
+def _render(user_id: int):
+    data = _LAST_RESULT.get(user_id)
+    if not data:
+        return None, None
+    return data["kind"], data["render"]()
+
 
 @dp.callback_query(F.data.startswith("card:"))
 async def make_card(callback: CallbackQuery):
-    data = _LAST_RESULT.get(callback.from_user.id)
-    if not data:
-        await callback.answer("Результат устарел, посчитай заново", show_alert=True)
+    kind, png = _render(callback.from_user.id)
+    if png is None:
+        await callback.answer("Результат устарел — посчитай заново", show_alert=True)
         return
-
-    kind = data["kind"]
-    brand = _brand()
-    if kind == "1rm":
-        png = cards.card_1rm(data["weight"], data["reps"], data["average"], data["table"], brand=brand)
-    elif kind in ("dots", "wilks", "ffmi"):
-        png = cards.card_score(data["label"], data["score"], data["sub_label"], data["sub_value"],
-                               brand=brand, gauge=data.get("gauge"))
-    elif kind == "kbju":
-        png = cards.card_kbju(data["target"], data["protein"], data["fat"], data["carbs"], data["goal_label"], brand=brand)
-    else:
-        await callback.answer("Неизвестный тип", show_alert=True)
-        return
-
-    # Отправляем как документ, а не как фото: Telegram агрессивно пережимает
-    # обычные фото (падает резкость текста на карточке), а документ уходит
-    # без потери качества — то, что нужно для карточки под соцсети.
-    photo = BufferedInputFile(png, filename="card.png")
     _log(callback.from_user.id, f"card_{kind}")
-    await callback.message.answer_document(
-        photo,
-        caption="Перешли другу — пусть посчитает свой 👇",
-        reply_markup=_share_kb(),
+    # Фото, а не документ: в чате сразу видно картинку, главная цифра читается в превью.
+    await callback.message.answer_photo(
+        BufferedInputFile(png, filename=f"{kind}.png"),
+        caption="Перешли другу — пусть посчитает свой.",
+        reply_markup=_card_kb(kind),
     )
     await callback.answer()
 
 
+@dp.callback_query(F.data.startswith("file:"))
+async def make_card_file(callback: CallbackQuery):
+    kind, png = _render(callback.from_user.id)
+    if png is None:
+        await callback.answer("Результат устарел — посчитай заново", show_alert=True)
+        return
+    _log(callback.from_user.id, f"file_{kind}")
+    await callback.message.answer_document(BufferedInputFile(png, filename=f"{kind}.png"))
+    await callback.answer()
+
+
 # ---------------------------------------------------------------------------
-# Глобальный обработчик ошибок — ловит любое неожиданное падение хендлера
-# (не только ValueError, который мы уже обрабатываем точечно) и пишет его
-# в лог (консоль + bot.log), чтобы баг не проходил тихо мимо.
+# Глобальный обработчик ошибок: неожиданное падение хендлера — в лог, бот живёт дальше
 # ---------------------------------------------------------------------------
 
 @dp.error()
 async def on_error(event):
     logger.error("Необработанное исключение при обработке апдейта", exc_info=event.exception)
-    return True  # подавляем дальнейшее всплытие, чтобы бот не падал целиком
+    return True
 
 
 # ---------------------------------------------------------------------------
-# Меню команд (кнопка "Меню" в Telegram рядом с полем ввода)
+# Меню команд (кнопка «Меню» рядом с полем ввода)
 # ---------------------------------------------------------------------------
 
 BOT_COMMANDS = [
-    BotCommand(command="rm", description="💪 1RM + раскладка по % (вес, повторы)"),
-    BotCommand(command="dots", description="⚖️ DOTS: пол, вес атлета, сумма"),
-    BotCommand(command="wilks", description="🏆 Wilks: пол, вес атлета, сумма"),
-    BotCommand(command="ffmi", description="📏 FFMI: рост, вес, % жира"),
-    BotCommand(command="kbju", description="🍗 КБЖУ: пол, возраст, рост, вес, активность, цель"),
-    BotCommand(command="rpe", description="🔥 Оценка 1ПМ по RPE: вес, повторы, RPE"),
-    BotCommand(command="warmup", description="🔧 Разминка до рабочего веса"),
-    BotCommand(command="rank", description="🏅 Разряд ЕВСК по сумме троеборья"),
-    BotCommand(command="help", description="ℹ️ Как пользоваться ботом"),
+    BotCommand(command="rm", description="Разовый максимум и рабочие веса"),
+    BotCommand(command="rpe", description="Максимум по RPE"),
+    BotCommand(command="warmup", description="Разминка до рабочего веса"),
+    BotCommand(command="dots", description="DOTS — сила с поправкой на вес"),
+    BotCommand(command="wilks", description="Wilks — сила с поправкой на вес"),
+    BotCommand(command="rank", description="Разряд ЕВСК по сумме троеборья"),
+    BotCommand(command="ffmi", description="FFMI — индекс сухой массы"),
+    BotCommand(command="kbju", description="Калории и БЖУ на день"),
+    BotCommand(command="help", description="Все команды"),
 ]
 
 
