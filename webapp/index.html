@@ -1,0 +1,24 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="color-scheme" content="light dark">
+  <title>Калькулятор зала</title>
+  <meta name="description" content="Разовый максимум, рабочие веса, разминка, DOTS и Wilks, разряд ЕВСК, FFMI и КБЖУ.">
+  <link rel="preload" href="fonts/PlexMono-Bold.woff" as="font" type="font/woff" crossorigin>
+  <link rel="preload" href="fonts/Inter-Regular.woff" as="font" type="font/woff" crossorigin>
+  <link rel="stylesheet" href="styles.css">
+  <script src="https://telegram.org/js/telegram-web-app.js?59"></script>
+</head>
+<body>
+  <header class="masthead">
+    <span id="crumb">ЖУРНАЛ / КАЛЬКУЛЯТОР</span>
+    <span id="date"></span>
+  </header>
+  <main id="app" aria-live="polite"></main>
+  <!-- Вне Telegram нет нативной MainButton — показываем свою -->
+  <div class="dock" id="dock" hidden><button type="button" class="primary" id="dockBtn"></button></div>
+  <script type="module" src="app.js"></script>
+</body>
+</html>
