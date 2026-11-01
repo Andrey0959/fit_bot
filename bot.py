@@ -2,6 +2,7 @@
 """
 Карманный математический инженер для зала.
 Стек: aiogram 3.x, python-dotenv, Pillow (карточки), sqlite3 (аналитика).
+Сценарии калькуляторов и тексты результатов — в wizard.py.
 
 Тон текстов: коротко, по делу, без эмодзи. Цифра — первой строкой.
 Запуск: см. README.md
@@ -17,6 +18,7 @@ from typing import Any, Awaitable, Callable
 from aiogram import BaseMiddleware, Bot, Dispatcher, F
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
+from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command, CommandObject, CommandStart
 from aiogram.types import (
     BotCommand,
@@ -27,16 +29,18 @@ from aiogram.types import (
     InlineQuery,
     InlineQueryResultArticle,
     InputTextMessageContent,
+    MenuButtonWebApp,
     Message,
     TelegramObject,
     User,
+    WebAppInfo,
 )
 from dotenv import load_dotenv
 
 import calculators as calc
-import cards
 import design
 import storage
+import wizard
 from design import num
 
 load_dotenv()
@@ -45,6 +49,8 @@ CHANNEL = os.getenv("CHANNEL", "thirstforfame1").lstrip("@")
 CHANNEL_URL = f"https://t.me/{CHANNEL}"
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0") or 0)  # свой user_id — для /stats
 DB_PATH = os.getenv("DB_PATH", "bot.db")
+# Мини-приложение (GitHub Pages). Пустая строка — кнопки приложения не показываются.
+WEBAPP_URL = os.getenv("WEBAPP_URL", "https://andrey0959.github.io/fit_bot/").strip()
 design.CHANNEL = f"t.me/{CHANNEL}"  # подпись в подвале карточек
 
 # Заполняется при старте из bot.get_me(): сменил бота в BotFather — ссылки поменялись сами.
@@ -73,24 +79,45 @@ dp = Dispatcher()
 # Только в памяти, до рестарта — callback_data ограничен 64 байтами.
 _LAST_RESULT: dict[int, dict] = {}
 
+# Пошаговый сценарий: {user_id: {"tool", "step", "data", "chat", "msg", "result"}}.
+# И последние ответы для кнопки «как в прошлый раз» — тоже только в памяти, на диск не пишем.
+_FLOW: dict[int, dict] = {}
+_LAST_INPUT: dict[int, dict] = {}
+
 
 # ---------------------------------------------------------------------------
-# Кнопки. Один стиль: глагол или существительное, без эмодзи.
+# Кнопки. Текст без эмодзи; эмодзи только в навигации: ⬅️ Назад и 🏠 Меню.
 # ---------------------------------------------------------------------------
+
+def _btn(text: str, data: str) -> InlineKeyboardButton:
+    return InlineKeyboardButton(text=text, callback_data=data)
+
 
 def _channel_row() -> list[InlineKeyboardButton]:
-    return [InlineKeyboardButton(text="Канал: разборы и программы", url=CHANNEL_URL)]
+    return [InlineKeyboardButton(text="Канал автора", url=CHANNEL_URL)]
 
 
-def _result_kb(kind: str) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="Карточка", callback_data=f"card:{kind}")],
-        _channel_row(),
-    ])
+def _nav_row(back: bool = True) -> list[InlineKeyboardButton]:
+    row = [_btn("⬅️ Назад", "nav:back")] if back else []
+    return row + [_btn("🏠 Меню", "nav:menu")]
 
 
-def _start_kb() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[_channel_row()])
+def _main_kb() -> InlineKeyboardMarkup:
+    rows = [
+        [_btn("Сила", "sec:strength"), _btn("Пауэрлифтинг", "sec:pl")],
+        [_btn("Тело и питание", "sec:body")],
+    ]
+    if WEBAPP_URL:
+        rows.append([InlineKeyboardButton(text="Открыть калькулятор", web_app=WebAppInfo(url=WEBAPP_URL))])
+    rows.append(_channel_row())
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def _section_kb(section: str) -> InlineKeyboardMarkup:
+    _, tools = wizard.SECTIONS[section]
+    rows = [[_btn(wizard.TOOLS[t].title, f"tool:{t}")] for t in tools]
+    rows.append(_nav_row(back=False))
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def _card_kb(kind: str) -> InlineKeyboardMarkup:
@@ -124,6 +151,11 @@ class TrackUsersMiddleware(BaseMiddleware):
                 storage.touch_user(user.id)
             except Exception:
                 logger.exception("Не удалось обновить пользователя в БД")
+            # Любая команда (/rm, /help…) прерывает пошаговый сценарий:
+            # следующее число не должно улететь в забытый шаг.
+            msg = getattr(event, "message", None)
+            if msg is not None and (msg.text or "").startswith("/"):
+                _FLOW.pop(user.id, None)
         return await handler(event, data)
 
 
@@ -139,25 +171,16 @@ def _log(user_id: int, kind: str) -> None:
 # ---------------------------------------------------------------------------
 
 HELP_TEXT = (
-    "<b>Карманный математический инженер для зала</b>\n"
-    "Цифры между подходами — готовая математика. Без сайтов и регистрации.\n\n"
-    "<b>Разовый максимум и рабочие веса</b>\n"
-    "<code>100 8</code> — вес и повторы, без команды\n\n"
-    "<b>RPE</b> — максимум по тяжести подхода\n"
-    "<code>/rpe 140 3 8</code> — вес, повторы, RPE 6–10\n\n"
-    "<b>Разминка</b> — подходы до рабочего веса\n"
-    "<code>/warmup 140</code> — рабочий вес; гриф вторым числом\n\n"
-    "<b>DOTS и Wilks</b> — сила с поправкой на вес тела\n"
-    "<code>/dots м 90 500</code> — пол, вес тела, сумма\n"
-    "<code>/wilks ж 62.5 280</code>\n\n"
-    "<b>Разряд ЕВСК</b> — классическое троеборье\n"
-    "<code>/rank м 90 500</code> — пол, вес тела, сумма\n\n"
-    "<b>FFMI</b> — индекс сухой массы\n"
-    "<code>/ffmi 180 85 15</code> — рост, вес, % жира\n\n"
-    "<b>КБЖУ</b> — калории и БЖУ на день\n"
-    "<code>/kbju м 30 180 85 3 сушка</code>\n"
-    "пол, возраст, рост, вес, активность 1–5, цель: сушка / поддержание / масса\n\n"
-    "Дробные — через точку или запятую. К каждому результату — кнопка «Карточка».\n"
+    "<b>Как пользоваться</b>\n"
+    "Проще всего — кнопками в меню: бот спросит всё по шагу.\n\n"
+    "Быстрые команды, если привык:\n"
+    "<code>100 8</code> — разовый максимум (вес, повторы)\n"
+    "<code>/rpe 140 3 8</code> — максимум по RPE\n"
+    "<code>/warmup 140</code> — разминка\n"
+    "<code>/dots м 90 500</code>, <code>/wilks ж 62.5 280</code> — пол, вес тела, сумма\n"
+    "<code>/rank м 90 500</code> — разряд ЕВСК\n"
+    "<code>/ffmi 180 85 15</code> — рост, вес, % жира\n"
+    "<code>/kbju м 30 180 85 3 сушка</code> — пол, возраст, рост, вес, активность 1–5, цель\n\n"
     "В любом чате: <code>@{bot} 100 8</code>"
 )
 
@@ -176,12 +199,19 @@ async def cmd_start(message: Message, command: CommandObject):
         except Exception:
             logger.exception("Не удалось сохранить источник")
     _log(message.from_user.id, "start")
-    await message.answer(_help_text(), reply_markup=_start_kb())
+    _FLOW.pop(message.from_user.id, None)
+    await message.answer(wizard.WELCOME, reply_markup=_main_kb())
+
+
+@dp.message(Command("menu"))
+async def cmd_menu(message: Message):
+    _FLOW.pop(message.from_user.id, None)
+    await message.answer(wizard.WELCOME, reply_markup=_main_kb())
 
 
 @dp.message(Command("help"))
 async def cmd_help(message: Message):
-    await message.answer(_help_text(), reply_markup=_start_kb())
+    await message.answer(_help_text(), reply_markup=InlineKeyboardMarkup(inline_keyboard=[_nav_row(back=False)]))
 
 
 # ---------------------------------------------------------------------------
@@ -248,6 +278,205 @@ _GOAL_MAP = {
 
 
 # ---------------------------------------------------------------------------
+# Меню и пошаговые сценарии. Одно сообщение бота на сценарий: каждый шаг
+# и результат редактируют его, ответы-числа пользователя удаляются.
+# ---------------------------------------------------------------------------
+
+async def _edit(bot: Bot, uid: int, chat_id: int, msg_id: int | None, text: str, kb: InlineKeyboardMarkup) -> int:
+    """Показать экран в сообщении msg_id; если его нельзя изменить — прислать новое."""
+    if msg_id:
+        try:
+            await bot.edit_message_text(text, chat_id=chat_id, message_id=msg_id, reply_markup=kb)
+            return msg_id
+        except TelegramBadRequest as e:
+            if "not modified" in str(e):
+                return msg_id
+    sent = await bot.send_message(chat_id, text, reply_markup=kb)
+    return sent.message_id
+
+
+def _remembered_label(step: wizard.Step, value) -> str:
+    if step.key == "sex":
+        return "Мужчина" if value == "m" else "Женщина"
+    if step.key == "activity":
+        return f"активность {value}"
+    return f"{num(value)} {step.unit}".strip()
+
+
+def _step_kb(uid: int, tool: wizard.Tool, i: int) -> InlineKeyboardMarkup:
+    step = tool.steps[i]
+    rows, row = [], []
+    for label, value in step.options:
+        row.append(_btn(label, f"ans:{value}"))
+        if len(row) == step.columns:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    prev = _LAST_INPUT.get(uid, {}).get(step.remember) if step.remember else None
+    if prev is not None:
+        value = prev if isinstance(prev, str) else num(prev)
+        rows.insert(0, [_btn(f"Как в прошлый раз: {_remembered_label(step, prev)}", f"ans:{value}")])
+    rows.append(_nav_row())
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def _wizard_result_kb(res: wizard.Result, showing_details: bool = False) -> InlineKeyboardMarkup:
+    top = []
+    if res.details and not showing_details:
+        top.append(_btn(res.details_label, "more"))
+    top.append(_btn("Карточка", f"card:{res.kind}"))
+    return InlineKeyboardMarkup(inline_keyboard=[top, [_btn("Посчитать ещё", "again")], _nav_row()])
+
+
+async def _show_step(bot: Bot, uid: int, error: str | None = None) -> None:
+    f = _FLOW[uid]
+    tool = wizard.TOOLS[f["tool"]]
+    f["msg"] = await _edit(bot, uid, f["chat"], f["msg"], wizard.step_text(tool, f["step"], error),
+                           _step_kb(uid, tool, f["step"]))
+
+
+async def _finish(bot: Bot, uid: int) -> None:
+    f = _FLOW[uid]
+    try:
+        res = wizard.compute(f["tool"], f["data"])
+    except ValueError as e:
+        f["step"] = 0
+        f["data"] = {}
+        await _show_step(bot, uid, _fail(str(e)))
+        return
+    f["step"] = None
+    f["result"] = res
+    _remember(uid, res.kind, res.render)
+    _log(uid, res.kind)
+    f["msg"] = await _edit(bot, uid, f["chat"], f["msg"], res.text, _wizard_result_kb(res))
+
+
+async def _answer(bot: Bot, uid: int, raw: str) -> None:
+    f = _FLOW[uid]
+    tool = wizard.TOOLS[f["tool"]]
+    step = tool.steps[f["step"]]
+    try:
+        value = wizard.parse(step, raw)
+    except ValueError as e:
+        await _show_step(bot, uid, str(e))
+        return
+    f["data"][step.key] = value
+    if step.remember:
+        _LAST_INPUT.setdefault(uid, {})[step.remember] = value
+    f["step"] += 1
+    if f["step"] >= len(tool.steps):
+        await _finish(bot, uid)
+    else:
+        await _show_step(bot, uid)
+
+
+async def _to_menu(bot: Bot, uid: int, chat_id: int, msg_id: int | None) -> None:
+    _FLOW.pop(uid, None)
+    await _edit(bot, uid, chat_id, msg_id, wizard.WELCOME, _main_kb())
+
+
+async def _to_section(bot: Bot, uid: int, chat_id: int, msg_id: int | None, section: str) -> None:
+    _FLOW.pop(uid, None)
+    await _edit(bot, uid, chat_id, msg_id, wizard.section_text(section), _section_kb(section))
+
+
+@dp.callback_query(F.data == "nav:menu")
+async def cb_menu(cb: CallbackQuery):
+    await cb.answer()
+    await _to_menu(cb.bot, cb.from_user.id, cb.message.chat.id, cb.message.message_id)
+
+
+@dp.callback_query(F.data.startswith("sec:"))
+async def cb_section(cb: CallbackQuery):
+    await cb.answer()
+    section = cb.data.split(":", 1)[1]
+    if section in wizard.SECTIONS:
+        await _to_section(cb.bot, cb.from_user.id, cb.message.chat.id, cb.message.message_id, section)
+
+
+@dp.callback_query(F.data.startswith("tool:"))
+async def cb_tool(cb: CallbackQuery):
+    await cb.answer()
+    key = cb.data.split(":", 1)[1]
+    if key not in wizard.TOOLS:
+        return
+    _FLOW[cb.from_user.id] = {"tool": key, "step": 0, "data": {}, "chat": cb.message.chat.id,
+                              "msg": cb.message.message_id, "result": None}
+    await _show_step(cb.bot, cb.from_user.id)
+
+
+@dp.callback_query(F.data.startswith("ans:"))
+async def cb_answer(cb: CallbackQuery):
+    f = _FLOW.get(cb.from_user.id)
+    if not f or f["step"] is None:
+        await cb.answer("Это старое меню — начнём заново")
+        await _to_menu(cb.bot, cb.from_user.id, cb.message.chat.id, cb.message.message_id)
+        return
+    await cb.answer()
+    f["msg"] = cb.message.message_id
+    await _answer(cb.bot, cb.from_user.id, cb.data.split(":", 1)[1])
+
+
+@dp.callback_query(F.data == "nav:back")
+async def cb_back(cb: CallbackQuery):
+    await cb.answer()
+    uid, chat_id, msg_id = cb.from_user.id, cb.message.chat.id, cb.message.message_id
+    f = _FLOW.get(uid)
+    if not f:
+        await _to_menu(cb.bot, uid, chat_id, msg_id)
+        return
+    tool = wizard.TOOLS[f["tool"]]
+    f["msg"] = msg_id
+    if f["step"] is None:          # с результата — к выбору калькулятора
+        await _to_section(cb.bot, uid, chat_id, msg_id, tool.section)
+    elif f["step"] == 0:
+        await _to_section(cb.bot, uid, chat_id, msg_id, tool.section)
+    else:
+        f["step"] -= 1
+        f["data"].pop(tool.steps[f["step"]].key, None)
+        await _show_step(cb.bot, uid)
+
+
+@dp.callback_query(F.data == "again")
+async def cb_again(cb: CallbackQuery):
+    await cb.answer()
+    f = _FLOW.get(cb.from_user.id)
+    if not f:
+        await _to_menu(cb.bot, cb.from_user.id, cb.message.chat.id, cb.message.message_id)
+        return
+    f.update(step=0, data={}, result=None, msg=cb.message.message_id)
+    await _show_step(cb.bot, cb.from_user.id)
+
+
+@dp.callback_query(F.data == "more")
+async def cb_more(cb: CallbackQuery):
+    await cb.answer()
+    f = _FLOW.get(cb.from_user.id)
+    if not f or not f.get("result") or not f["result"].details:
+        return
+    res = f["result"]
+    f["msg"] = await _edit(cb.bot, cb.from_user.id, cb.message.chat.id, cb.message.message_id,
+                           res.details, _wizard_result_kb(res, showing_details=True))
+
+
+def _awaiting_text(message: Message) -> bool:
+    f = _FLOW.get(message.from_user.id) if message.from_user else None
+    return bool(f and f["step"] is not None and message.text and not message.text.startswith("/"))
+
+
+@dp.message(_awaiting_text)
+async def flow_text(message: Message):
+    uid = message.from_user.id
+    _FLOW[uid]["chat"] = message.chat.id
+    try:
+        await message.delete()  # ответ-число больше не нужен: экран обновится
+    except Exception:  # нет прав или сообщение старое — не страшно
+        pass
+    await _answer(message.bot, uid, message.text)
+
+
+# ---------------------------------------------------------------------------
 # 1RM — быстрый путь: просто два числа без команды
 # ---------------------------------------------------------------------------
 
@@ -270,32 +499,47 @@ def _format_1rm(r: calc.OneRMResult) -> str:
     return "\n".join(lines)
 
 
+async def _reply_err(message: Message, text: str) -> None:
+    """Ошибка ввода — не тупик: под ней всегда есть выход в меню."""
+    await message.answer(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=[_nav_row(back=False)]))
+
+
+async def _send_result(message: Message, tool_key: str, data: dict) -> None:
+    """Быстрые команды отвечают так же, как пошаговый сценарий: цифра, пояснение, кнопки."""
+    try:
+        res = wizard.compute(tool_key, data)
+    except ValueError as e:
+        await _reply_err(message, _fail(str(e)))
+        return
+    uid = message.from_user.id
+    _remember(uid, res.kind, res.render)
+    _log(uid, res.kind)
+    sent = await message.answer(res.text, reply_markup=_wizard_result_kb(res))
+    # Состояние «на экране результата»: работают «Все проценты», «Посчитать ещё», «Назад».
+    flow_tool = tool_key if tool_key in wizard.TOOLS else "dots"  # wilks живёт в сценарии DOTS
+    _FLOW[uid] = {"tool": flow_tool, "step": None, "data": data, "chat": message.chat.id,
+                  "msg": getattr(sent, "message_id", None), "result": res}
+
+
 async def _send_1rm(message: Message, weight: float, reps_f: float):
     reps = int(round(reps_f))
     if reps >= 37:  # формула Brzycki делит на (37 - повторы)
-        await message.answer(_fail("для 37+ повторов разовый максимум не считается"))
+        await _reply_err(message, _fail("для 37+ повторов разовый максимум не считается"))
         return
-    try:
-        r = calc.calc_1rm(weight, reps)
-    except ValueError as e:
-        await message.answer(_fail(str(e)))
-        return
-    _remember(message.from_user.id, "1rm", lambda: cards.card_1rm(r))
-    _log(message.from_user.id, "1rm")
-    await message.answer(_format_1rm(r), reply_markup=_result_kb("1rm"))
+    await _send_result(message, "1rm", {"weight": weight, "reps": reps})
 
 
 @dp.message(Command("rm"))
 async def cmd_rm(message: Message):
     args = _args(message)
     if len(args) != 2:
-        await message.answer(_usage("/rm 100 8", "вес, повторы"))
+        await _reply_err(message, _usage("/rm 100 8", "вес, повторы"))
         return
     try:
         weight = calc.parse_number(args[0])
         reps = calc.parse_number(args[1])
     except ValueError:
-        await message.answer(_fail("не разобрал числа. Пример: /rm 100 8"))
+        await _reply_err(message, _fail("не разобрал числа. Пример: /rm 100 8"))
         return
     await _send_1rm(message, weight, reps)
 
@@ -361,28 +605,14 @@ async def inline_1rm(query: InlineQuery):
 async def _strength_score(message: Message, kind: str):
     args = _args(message)
     if len(args) != 3:
-        await message.answer(_usage(f"/{kind} м 90 500", "пол, вес тела, сумма"))
+        await _reply_err(message, _usage(f"/{kind} м 90 500", "пол, вес тела, сумма"))
         return
     try:
-        sex = _norm_sex(args[0])
-        bw = calc.parse_number(args[1])
-        total = calc.parse_number(args[2])
-        dots = calc.calc_dots(sex, bw, total)
-        wilks = calc.calc_wilks(sex, bw, total)
+        data = {"sex": _norm_sex(args[0]), "bw": calc.parse_number(args[1]), "total": calc.parse_number(args[2])}
     except ValueError as e:
-        await message.answer(_fail(str(e)))
+        await _reply_err(message, _fail(str(e)))
         return
-
-    main, other = (("DOTS", dots), ("Wilks", wilks)) if kind == "dots" else (("Wilks", wilks), ("DOTS", dots))
-    sex_label = "мужчина" if sex == "m" else "женщина"
-    text = (
-        f"<b>{main[0]} {num(main[1])}</b>\n"
-        f"{sex_label.capitalize()} · вес тела {num(bw)} кг · сумма {num(total)} кг\n"
-        f"{other[0]} — {num(other[1])}"
-    )
-    _remember(message.from_user.id, kind, lambda: cards.card_strength(sex, bw, total, dots, wilks, kind))
-    _log(message.from_user.id, kind)
-    await message.answer(text, reply_markup=_result_kb(kind))
+    await _send_result(message, kind, data)
 
 
 @dp.message(Command("dots"))
@@ -395,183 +625,85 @@ async def cmd_wilks(message: Message):
     await _strength_score(message, "wilks")
 
 
-# ---------------------------------------------------------------------------
-# FFMI
-# ---------------------------------------------------------------------------
+@dp.message(Command("rank"))
+async def cmd_rank(message: Message):
+    args = _args(message)
+    if len(args) != 3:
+        await _reply_err(message, _usage("/rank м 90 500", "пол, вес тела, сумма троеборья"))
+        return
+    try:
+        data = {"sex": _norm_sex(args[0]), "bw": calc.parse_number(args[1]), "total": calc.parse_number(args[2])}
+    except ValueError as e:
+        await _reply_err(message, _fail(str(e)))
+        return
+    await _send_result(message, "rank", data)
+
 
 @dp.message(Command("ffmi"))
 async def cmd_ffmi(message: Message):
     args = _args(message)
     if len(args) != 3:
-        await message.answer(_usage("/ffmi 180 85 15", "рост в см, вес в кг, % жира"))
+        await _reply_err(message, _usage("/ffmi 180 85 15", "рост в см, вес в кг, % жира"))
         return
     try:
-        height = calc.parse_number(args[0])
-        weight = calc.parse_number(args[1])
-        bf = calc.parse_number(args[2])
-        r = calc.calc_ffmi(height, weight, bf)
+        data = {"height": calc.parse_number(args[0]), "weight": calc.parse_number(args[1]),
+                "bf": calc.parse_number(args[2])}
     except ValueError as e:
-        await message.answer(_fail(str(e)))
+        await _reply_err(message, _fail(str(e)))
         return
+    await _send_result(message, "ffmi", data)
 
-    text = (
-        f"<b>FFMI {num(r.normalized_ffmi)}</b> (без поправки на рост {num(r.ffmi)})\n"
-        f"Сухая масса — {num(r.lean_mass)} кг\n"
-        f"{r.verdict.capitalize()}.\n\n"
-        f"Точность упирается в замер % жира: на глаз — плюс-минус несколько единиц."
-    )
-    _remember(message.from_user.id, "ffmi", lambda: cards.card_ffmi(height, weight, bf, r))
-    _log(message.from_user.id, "ffmi")
-    await message.answer(text, reply_markup=_result_kb("ffmi"))
-
-
-# ---------------------------------------------------------------------------
-# КБЖУ
-# ---------------------------------------------------------------------------
 
 @dp.message(Command("kbju"))
 async def cmd_kbju(message: Message):
     args = _args(message)
     if len(args) != 6:
-        await message.answer(_usage(
+        await _reply_err(message, _usage(
             "/kbju м 30 180 85 3 сушка",
             "пол, возраст, рост, вес, активность 1–5, цель: сушка / поддержание / масса",
         ))
         return
     try:
-        sex = _norm_sex(args[0])
-        age = int(calc.parse_number(args[1]))
-        height = calc.parse_number(args[2])
-        weight = calc.parse_number(args[3])
-        activity = int(calc.parse_number(args[4]))
         goal_raw = args[5].strip().lower()
         if goal_raw not in _GOAL_MAP:
             raise ValueError("цель — сушка, поддержание или масса")
-        goal = _GOAL_MAP[goal_raw]
-        # Миффлин-Сан Жеор выведена на взрослых, а дефицит калорий растущему
-        # организму без врача давать нельзя — поэтому до 18 лет «сушку»
-        # не считаем, показываем поддержание с объяснением.
-        teen_note = None
-        if age < 18:
-            teen_note = "До 18 лет — грубый ориентир."
-            if goal == "cut":
-                goal = "maintain"
-                teen_note += " Дефицит без врача не считаю: показано поддержание."
-        r = calc.calc_kbju(sex, age, height, weight, activity, goal)
+        data = {"sex": _norm_sex(args[0]), "age": int(calc.parse_number(args[1])),
+                "height": calc.parse_number(args[2]), "weight": calc.parse_number(args[3]),
+                "activity": str(int(calc.parse_number(args[4]))), "goal": _GOAL_MAP[goal_raw]}
     except ValueError as e:
-        await message.answer(_fail(str(e)))
+        await _reply_err(message, _fail(str(e)))
         return
+    await _send_result(message, "kbju", data)
 
-    text = (
-        f"<b>{num(r.target_kcal, 0)} ккал в день</b> — {r.goal_label}\n"
-        f"Белки {num(r.protein_g, 0)} г · жиры {num(r.fat_g, 0)} г · углеводы {num(r.carbs_g, 0)} г\n\n"
-        f"В покое — {num(r.bmr, 0)} ккал, с активностью — {num(r.tdee, 0)} ккал\n"
-        f"Активность: {r.activity_label}"
-    )
-    if teen_note:
-        text += f"\n\n{teen_note}"
-    _remember(message.from_user.id, "kbju", lambda: cards.card_kbju(weight, r, teen_note))
-    _log(message.from_user.id, "kbju")
-    await message.answer(text, reply_markup=_result_kb("kbju"))
-
-
-# ---------------------------------------------------------------------------
-# RPE
-# ---------------------------------------------------------------------------
 
 @dp.message(Command("rpe"))
 async def cmd_rpe(message: Message):
     args = _args(message)
     if len(args) != 3:
-        await message.answer(_usage("/rpe 140 3 8", "вес, повторы, RPE от 6 до 10"))
+        await _reply_err(message, _usage("/rpe 140 3 8", "вес, повторы, RPE от 6 до 10"))
         return
     try:
-        weight = calc.parse_number(args[0])
-        reps = calc.parse_number(args[1])
-        rpe = calc.parse_number(args[2])
-        r = calc.calc_rpe(weight, reps, rpe)
+        data = {"weight": calc.parse_number(args[0]), "reps": calc.parse_number(args[1]),
+                "rpe": calc.parse_number(args[2])}
     except ValueError as e:
-        await message.answer(_fail(str(e)))
+        await _reply_err(message, _fail(str(e)))
         return
+    await _send_result(message, "rpe", data)
 
-    lines = [
-        f"<b>1RM ≈ {num(r.estimated_1rm)} кг</b>",
-        f"Подход: {num(r.weight)} кг × {r.reps} на RPE {num(r.rpe_used)}",
-    ]
-    if r.rpe_used != r.rpe:
-        lines.append(f"RPE {num(r.rpe)} округлён до {num(r.rpe_used)}: шаг таблицы 0.5")
-    lines += ["", f"<b>{r.reps} повт. на другом RPE</b>"]
-    lines += [f"RPE {num(x)} — {num(w)} кг" for x, w in r.projection]
-    _remember(message.from_user.id, "rpe", lambda: cards.card_rpe(r))
-    _log(message.from_user.id, "rpe")
-    await message.answer("\n".join(lines), reply_markup=_result_kb("rpe"))
-
-
-# ---------------------------------------------------------------------------
-# Разминка
-# ---------------------------------------------------------------------------
 
 @dp.message(Command("warmup"))
 async def cmd_warmup(message: Message):
     args = _args(message)
     if len(args) not in (1, 2):
-        await message.answer(_usage("/warmup 140", "рабочий вес; свой гриф — вторым числом: /warmup 140 15"))
+        await _reply_err(message, _usage("/warmup 140", "рабочий вес; свой гриф — вторым числом: /warmup 140 15"))
         return
     try:
-        work_weight = calc.parse_number(args[0])
-        bar_weight = calc.parse_number(args[1]) if len(args) == 2 else 20.0
-        steps = calc.generate_warmup(work_weight, bar_weight)
+        data = {"work": calc.parse_number(args[0]),
+                "bar": calc.parse_number(args[1]) if len(args) == 2 else 20.0}
     except ValueError as e:
-        await message.answer(_fail(str(e)))
+        await _reply_err(message, _fail(str(e)))
         return
-
-    lines = [f"<b>Разминка до {num(work_weight)} кг</b>", f"Гриф {num(bar_weight)} кг", ""]
-    for step in steps:
-        if step.reps:
-            lines.append(f"{step.label} — {num(step.weight)} кг × {step.reps}")
-        else:
-            lines.append(f"<b>{step.label} — {num(step.weight)} кг</b>")
-    _remember(message.from_user.id, "warmup", lambda: cards.card_warmup(work_weight, bar_weight, steps))
-    _log(message.from_user.id, "warmup")
-    await message.answer("\n".join(lines), reply_markup=_result_kb("warmup"))
-
-
-# ---------------------------------------------------------------------------
-# Разряд ЕВСК (классическое троеборье, без экипировки)
-# ---------------------------------------------------------------------------
-
-def _rank_ladder(sex: str, bodyweight: float) -> list[tuple[str, float | None]]:
-    """Нормативы весовой категории — для карточки. Таблицы из calculators не меняются."""
-    table = calc._RANK_TABLE_M if sex == "m" else calc._RANK_TABLE_F
-    cats = sorted(table)
-    cat = next((c for c in cats if bodyweight <= c), cats[-1])
-    return [(name, table[cat][name]) for name in calc._RANK_ORDER]
-
-
-@dp.message(Command("rank"))
-async def cmd_rank(message: Message):
-    args = _args(message)
-    if len(args) != 3:
-        await message.answer(_usage("/rank м 90 500", "пол, вес тела, сумма троеборья"))
-        return
-    try:
-        sex = _norm_sex(args[0])
-        bw = calc.parse_number(args[1])
-        total = calc.parse_number(args[2])
-        r = calc.calc_rank(sex, bw, total)
-    except ValueError as e:
-        await message.answer(_fail(str(e)))
-        return
-
-    head = f"<b>Разряд: {r.rank}</b>" if r.rank != "нет разряда" else "<b>Разряда пока нет</b> — ниже III юношеского"
-    lines = [head, f"Категория до {r.weight_class} кг · сумма {num(total)} кг"]
-    if r.next_rank:
-        lines.append(f"До {r.next_rank} — {num(r.gap_to_next)} кг")
-    lines += ["", "Классика, нормативы ЕВСК с поправками 2023–2024. Разряд присваивают по протоколу соревнований."]
-    ladder = _rank_ladder(sex, bw)
-    _remember(message.from_user.id, "rank", lambda: cards.card_rank(sex, bw, total, r, ladder))
-    _log(message.from_user.id, "rank")
-    await message.answer("\n".join(lines), reply_markup=_result_kb("rank"))
+    await _send_result(message, "warmup", data)
 
 
 # ---------------------------------------------------------------------------
@@ -613,6 +745,18 @@ async def make_card_file(callback: CallbackQuery):
 
 
 # ---------------------------------------------------------------------------
+# Всё остальное: непонятный текст — не тупик, а меню
+# ---------------------------------------------------------------------------
+
+@dp.message(F.text & ~F.text.startswith("/") & ~F.via_bot)
+async def fallback(message: Message):
+    await message.answer(
+        "Не понял. Выбери калькулятор кнопкой ниже — или напиши вес и повторы, например <code>100 8</code>.",
+        reply_markup=_main_kb(),
+    )
+
+
+# ---------------------------------------------------------------------------
 # Глобальный обработчик ошибок: неожиданное падение хендлера — в лог, бот живёт дальше
 # ---------------------------------------------------------------------------
 
@@ -627,16 +771,34 @@ async def on_error(event):
 # ---------------------------------------------------------------------------
 
 BOT_COMMANDS = [
-    BotCommand(command="rm", description="Разовый максимум и рабочие веса"),
-    BotCommand(command="rpe", description="Максимум по RPE"),
-    BotCommand(command="warmup", description="Разминка до рабочего веса"),
-    BotCommand(command="dots", description="DOTS — сила с поправкой на вес"),
-    BotCommand(command="wilks", description="Wilks — сила с поправкой на вес"),
-    BotCommand(command="rank", description="Разряд ЕВСК по сумме троеборья"),
-    BotCommand(command="ffmi", description="FFMI — индекс сухой массы"),
+    BotCommand(command="start", description="Главное меню"),
+    BotCommand(command="rm", description="Разовый максимум: /rm 100 8"),
     BotCommand(command="kbju", description="Калории и БЖУ на день"),
-    BotCommand(command="help", description="Все команды"),
+    BotCommand(command="help", description="Как пользоваться и быстрые команды"),
 ]
+
+BOT_DESCRIPTION = (
+    "Считает разовый максимум, рабочие веса, разминку, DOTS и Wilks, разряд ЕВСК, FFMI и КБЖУ. "
+    "Пишешь цифры — получаешь математику и карточку для сторис."
+)
+BOT_SHORT_DESCRIPTION = "Калькулятор зала: максимум, рабочие веса, разряды, КБЖУ. Цифры без хайпа."
+
+
+async def _setup_profile(bot: Bot) -> None:
+    """Меню команд, описание и кнопка мини-приложения. Ошибка тут не должна ронять бота."""
+    steps = [
+        ("команды", bot.set_my_commands(BOT_COMMANDS)),
+        ("описание", bot.set_my_description(BOT_DESCRIPTION)),
+        ("короткое описание", bot.set_my_short_description(BOT_SHORT_DESCRIPTION)),
+    ]
+    if WEBAPP_URL:
+        steps.append(("кнопка меню", bot.set_chat_menu_button(
+            menu_button=MenuButtonWebApp(text="Открыть калькулятор", web_app=WebAppInfo(url=WEBAPP_URL)))))
+    for name, coro in steps:
+        try:
+            await coro
+        except Exception as e:  # сеть, лимиты Telegram — бот работает и без этого
+            logger.warning("Не удалось обновить %s: %s", name, e)
 
 
 async def main():
@@ -649,7 +811,7 @@ async def main():
     me = await bot.get_me()
     BOT_USERNAME = me.username
     logger.info("Бот @%s, канал @%s, БД %s", BOT_USERNAME, CHANNEL, DB_PATH)
-    await bot.set_my_commands(BOT_COMMANDS)
+    await _setup_profile(bot)
     await dp.start_polling(bot)
 
 
