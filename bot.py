@@ -47,15 +47,21 @@ DB_PATH = os.getenv("DB_PATH", "bot.db")
 # сменил бота в BotFather — подпись на карточках поменялась сама.
 BOT_USERNAME = ""
 
+_log_handlers: list[logging.Handler] = [logging.StreamHandler()]  # консоль / логи хостинга
+try:
+    # Файл логов (максимум ~8 МБ: 4 файла по 2 МБ). На хостингах с диском
+    # "только для чтения" (Deployka) кладём его через LOG_PATH в /data,
+    # а если писать некуда — работаем только с консолью, а не падаем.
+    _log_handlers.append(RotatingFileHandler(
+        os.getenv("LOG_PATH", "bot.log"), maxBytes=2_000_000, backupCount=3, encoding="utf-8"
+    ))
+except OSError:
+    pass
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    handlers=[
-        logging.StreamHandler(),  # видно в терминале / логах Railway как раньше
-        RotatingFileHandler(
-            "bot.log", maxBytes=2_000_000, backupCount=3, encoding="utf-8"
-        ),  # + свой файл рядом с bot.py, максимум ~8 МБ суммарно (4 файла по 2 МБ)
-    ],
+    handlers=_log_handlers,
 )
 logger = logging.getLogger(__name__)
 dp = Dispatcher()
