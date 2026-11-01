@@ -193,6 +193,9 @@ def _help_text() -> str:
 async def cmd_start(message: Message, command: CommandObject):
     # t.me/bot?start=vk_clip1 -> source="vk_clip1": так видно, какой ролик/пост привёл людей
     source = (command.args or "").strip()[:64] or None
+    deeplink = wizard.parse_deeplink(source) if source and source.startswith("c-") else None
+    if source and source.startswith("c-"):
+        source = "webapp"  # кнопка «карточка в чат» из мини-приложения
     if source:
         try:
             storage.touch_user(message.from_user.id, source)
@@ -200,6 +203,11 @@ async def cmd_start(message: Message, command: CommandObject):
             logger.exception("Не удалось сохранить источник")
     _log(message.from_user.id, "start")
     _FLOW.pop(message.from_user.id, None)
+    if deeplink:
+        tool, data = deeplink
+        await _send_result(message, tool, data)
+        await _send_card(message, message.from_user.id)
+        return
     await message.answer(wizard.WELCOME, reply_markup=_main_kb())
 
 
@@ -717,19 +725,25 @@ def _render(user_id: int):
     return data["kind"], data["render"]()
 
 
-@dp.callback_query(F.data.startswith("card:"))
-async def make_card(callback: CallbackQuery):
-    kind, png = _render(callback.from_user.id)
+async def _send_card(message: Message, user_id: int) -> bool:
+    kind, png = _render(user_id)
     if png is None:
-        await callback.answer("Результат устарел — посчитай заново", show_alert=True)
-        return
-    _log(callback.from_user.id, f"card_{kind}")
+        return False
+    _log(user_id, f"card_{kind}")
     # Фото, а не документ: в чате сразу видно картинку, главная цифра читается в превью.
-    await callback.message.answer_photo(
+    await message.answer_photo(
         BufferedInputFile(png, filename=f"{kind}.png"),
         caption="Перешли другу — пусть посчитает свой.",
         reply_markup=_card_kb(kind),
     )
+    return True
+
+
+@dp.callback_query(F.data.startswith("card:"))
+async def make_card(callback: CallbackQuery):
+    if not await _send_card(callback.message, callback.from_user.id):
+        await callback.answer("Результат устарел — посчитай заново", show_alert=True)
+        return
     await callback.answer()
 
 

@@ -166,6 +166,34 @@ def parse(step: Step, raw: str):
     return value
 
 
+# Мини-приложение просит карточку ссылкой t.me/<бот>?start=c-1rm-102d5-5:
+# точка в числах — «d» (в параметре start разрешены только A-Z a-z 0-9 _ -).
+DEEPLINK_ORDER = {
+    "1rm": ["weight", "reps"], "rpe": ["weight", "reps", "rpe"], "warmup": ["work", "bar"],
+    "dots": ["sex", "bw", "total"], "rank": ["sex", "bw", "total"], "ffmi": ["height", "weight", "bf"],
+    "kbju": ["sex", "age", "height", "weight", "activity", "goal"],
+}
+
+
+def parse_deeplink(payload: str):
+    """'c-ffmi-180-85-15' -> ('ffmi', {...}) или None, если ссылка битая. Проверка — как у ответов в боте."""
+    parts = (payload or "").split("-")
+    if len(parts) < 3 or parts[0] != "c" or parts[1] not in DEEPLINK_ORDER:
+        return None
+    tool, keys = parts[1], DEEPLINK_ORDER[parts[1]]
+    if len(parts) - 2 != len(keys):
+        return None
+    steps = {s.key: s for s in TOOLS[tool].steps}
+    data = {}
+    try:
+        for key, raw in zip(keys, parts[2:]):
+            step = steps[key]
+            data[key] = parse(step, raw if step.kind == "choice" else raw.replace("d", "."))
+    except (ValueError, KeyError):
+        return None
+    return tool, data
+
+
 # ---------------------------------------------------------------------------
 # Общие помощники (используются и командами, и пошаговыми сценариями)
 # ---------------------------------------------------------------------------
