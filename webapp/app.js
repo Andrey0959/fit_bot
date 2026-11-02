@@ -3,7 +3,7 @@
 import * as C from "./calc.js";
 import * as Card from "./card.js";
 
-const BOT = "matematika_zala_bot";
+const BOT = "ThirstForFame_bot";
 const tg = window.Telegram?.WebApp;
 const inTelegram = Boolean(tg && tg.initData);
 const can = (v) => inTelegram && tg.isVersionAtLeast?.(v);
