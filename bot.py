@@ -106,6 +106,7 @@ def _main_kb() -> InlineKeyboardMarkup:
     rows = [
         [_btn("Сила", "sec:strength"), _btn("Пауэрлифтинг", "sec:pl")],
         [_btn("Тело и питание", "sec:body")],
+        [_btn("📖 Объяснение терминов", "gl")],
     ]
     if WEBAPP_URL:
         rows.append([InlineKeyboardButton(text="Открыть калькулятор", web_app=WebAppInfo(url=WEBAPP_URL))])
@@ -172,7 +173,8 @@ def _log(user_id: int, kind: str) -> None:
 
 HELP_TEXT = (
     "<b>Как пользоваться</b>\n"
-    "Проще всего — кнопками в меню: бот спросит всё по шагу.\n\n"
+    "Проще всего — кнопками в меню: бот спросит всё по шагу. "
+    "Непонятные слова — в «📖 Объяснение терминов».\n\n"
     "Быстрые команды, если привык:\n"
     "<code>100 8</code> — разовый максимум (вес, повторы)\n"
     "<code>/rpe 140 3 8</code> — максимум по RPE\n"
@@ -334,7 +336,11 @@ def _wizard_result_kb(res: wizard.Result, showing_details: bool = False) -> Inli
     if res.details and not showing_details:
         top.append(_btn(res.details_label, "more"))
     top.append(_btn("Карточка", f"card:{res.kind}"))
-    return InlineKeyboardMarkup(inline_keyboard=[top, [_btn("Посчитать ещё", "again")], _nav_row()])
+    return InlineKeyboardMarkup(inline_keyboard=[
+        top,
+        [_btn("Посчитать ещё", "again"), _btn("📖 Что это значит?", f"glr:{wizard.section_of(res.kind)}")],
+        _nav_row(),
+    ])
 
 
 async def _show_step(bot: Bot, uid: int, error: str | None = None) -> None:
@@ -466,6 +472,58 @@ async def cb_more(cb: CallbackQuery):
     res = f["result"]
     f["msg"] = await _edit(cb.bot, cb.from_user.id, cb.message.chat.id, cb.message.message_id,
                            res.details, _wizard_result_kb(res, showing_details=True))
+
+
+# ---- Объяснение терминов ----
+
+def _glossary_index_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [_btn(title, f"gl:{key}")] for key, (title, _) in wizard.SECTIONS.items()
+    ] + [[_btn("⬅️ Назад", "nav:menu"), _btn("🏠 Меню", "nav:menu")]])
+
+
+@dp.callback_query(F.data == "gl")
+async def cb_glossary(cb: CallbackQuery):
+    await cb.answer()
+    _FLOW.pop(cb.from_user.id, None)
+    _log(cb.from_user.id, "glossary")
+    await _edit(cb.bot, cb.from_user.id, cb.message.chat.id, cb.message.message_id,
+                wizard.GLOSSARY_INTRO, _glossary_index_kb())
+
+
+@dp.callback_query(F.data.startswith("gl:"))
+async def cb_glossary_section(cb: CallbackQuery):
+    await cb.answer()
+    section = cb.data.split(":", 1)[1]
+    if section not in wizard.GLOSSARY:
+        return
+    kb = InlineKeyboardMarkup(inline_keyboard=[[_btn("⬅️ Назад", "gl"), _btn("🏠 Меню", "nav:menu")]])
+    await _edit(cb.bot, cb.from_user.id, cb.message.chat.id, cb.message.message_id, wizard.GLOSSARY[section], kb)
+
+
+@dp.callback_query(F.data.startswith("glr:"))
+async def cb_glossary_from_result(cb: CallbackQuery):
+    """Термины прямо с экрана результата; «Назад» возвращает к цифрам."""
+    await cb.answer()
+    section = cb.data.split(":", 1)[1]
+    if section not in wizard.GLOSSARY:
+        return
+    _log(cb.from_user.id, "glossary")
+    kb = InlineKeyboardMarkup(inline_keyboard=[[_btn("⬅️ К результату", "res"), _btn("🏠 Меню", "nav:menu")]])
+    await _edit(cb.bot, cb.from_user.id, cb.message.chat.id, cb.message.message_id, wizard.GLOSSARY[section], kb)
+
+
+@dp.callback_query(F.data == "res")
+async def cb_back_to_result(cb: CallbackQuery):
+    f = _FLOW.get(cb.from_user.id)
+    if not f or not f.get("result"):
+        await cb.answer("Результат устарел — посчитай заново")
+        await _to_menu(cb.bot, cb.from_user.id, cb.message.chat.id, cb.message.message_id)
+        return
+    await cb.answer()
+    res = f["result"]
+    f["msg"] = await _edit(cb.bot, cb.from_user.id, cb.message.chat.id, cb.message.message_id,
+                           res.text, _wizard_result_kb(res))
 
 
 def _awaiting_text(message: Message) -> bool:
