@@ -296,15 +296,12 @@ export function scaleLabel(value, [vmin, vmax, labels]) {
   return labels[Math.min(labels.length - 1, Math.trunc(t * labels.length))];
 }
 
-/** До 18 лет «сушку» не считаем — показываем поддержание (как в боте). */
+/** Любая цель для любого возраста; до 18 лет — предупреждение (как в боте). */
 export function kbjuWithGuard(sex, age, height, weight, activity, goal) {
   let note = null;
   if (age < 18) {
-    note = "До 18 лет — грубый ориентир.";
-    if (goal === "cut") {
-      goal = "maintain";
-      note += " Дефицит без врача не считаю: показано поддержание.";
-    }
+    note = "До 18 лет — грубый ориентир: формула выведена на взрослых.";
+    if (goal === "cut") note += " Дефицит лучше согласовать с врачом.";
   }
   return [calcKbju(sex, age, height, weight, activity, goal), note];
 }
